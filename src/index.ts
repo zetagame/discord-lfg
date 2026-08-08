@@ -81,7 +81,7 @@ async function lfg(i: DiscordInteraction, env: Env, games: Game[]): Promise<Resp
     .bind(crypto.randomUUID(), i.guild_id, i.channel_id, userId(i), JSON.stringify(games.map((game) => game.id)), starts || null, note || null).run();
   const placeholders = games.map(() => "?").join(",");
   const watchers = await env.DB.prepare(
-    `SELECT DISTINCT user_id FROM subscriptions WHERE guild_id = ? AND game_id IN (${placeholders}) AND (muted_until IS NULL OR muted_until <= CURRENT_TIMESTAMP)`,
+    `SELECT DISTINCT user_id FROM subscriptions WHERE guild_id = ? AND game_id IN (${placeholders}) AND (muted_until IS NULL OR julianday(muted_until) <= julianday('now'))`,
   ).bind(i.guild_id, ...games.map((game) => game.id)).all<{ user_id: string }>();
   const mentions = watchers.results.map((watcher) => `<@${watcher.user_id}>`).join(" ");
   return publicEmbed("LFG", `${gameNames(games)}${starts ? `\nStarts: ${starts}` : ""}${note ? `\n${note}` : ""}${mentions ? `\nWatchers: ${mentions}` : ""}`);
