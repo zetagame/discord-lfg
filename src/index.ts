@@ -66,7 +66,7 @@ export default {
 async function registerCommands(env: Env): Promise<Response> {
   if (!env.DISCORD_BOT_TOKEN) return new Response("DISCORD_BOT_TOKEN is not configured.", { status: 500 });
   const headers = { authorization: `Bot ${env.DISCORD_BOT_TOKEN}`, "content-type": "application/json" };
-  const appResponse = await fetch("https://discord.com/api/v10/applications/@me", { headers });
+  const appResponse = await fetch("https://discord.com/api/v10/oauth2/applications/@me", { headers });
   if (!appResponse.ok) return new Response(`Could not identify Discord application (${appResponse.status}).`, { status: 502 });
   const application = await appResponse.json() as { id: string };
   const response = await fetch(`https://discord.com/api/v10/applications/${application.id}/commands`, {
@@ -147,21 +147,27 @@ function lfgMessageData(snapshot: LfgSnapshot, loadingAction?: "pause" | "resume
       : state === "paused" ? "Paused"
         : state === "stopped" ? "Stopped"
           : "Expired";
+  const primaryControl = state === "paused"
+    ? { type: 2, style: 1, label: "▶ Resume", custom_id: `lfg:resume:${snapshot.lfg.id}` }
+    : { type: 2, style: 1, label: "⏸ Pause", custom_id: `lfg:pause:${snapshot.lfg.id}` };
   const components = state === "stopped" || state === "expired"
     ? []
     : [{
       type: 1,
-      components: loadingAction
+      components: loadingAction === "stop"
         ? [
-          { type: 2, style: 1, label: `⏳ ${status}`, custom_id: `lfg:busy:${snapshot.lfg.id}`, disabled: true },
-          { type: 2, style: 4, label: "■ Stop", custom_id: `lfg:stop:${snapshot.lfg.id}`, disabled: true },
+          { ...primaryControl, disabled: true },
+          { type: 2, style: 4, label: "⏳ Stopping…", custom_id: `lfg:busy:${snapshot.lfg.id}`, disabled: true },
         ]
-        : [
-          state === "paused"
-            ? { type: 2, style: 1, label: "▶ Resume", custom_id: `lfg:resume:${snapshot.lfg.id}` }
-            : { type: 2, style: 1, label: "⏸ Pause", custom_id: `lfg:pause:${snapshot.lfg.id}` },
-          { type: 2, style: 4, label: "■ Stop", custom_id: `lfg:stop:${snapshot.lfg.id}` },
-        ],
+        : loadingAction
+          ? [
+            { type: 2, style: 1, label: `⏳ ${status}`, custom_id: `lfg:busy:${snapshot.lfg.id}`, disabled: true },
+            { type: 2, style: 4, label: "■ Stop", custom_id: `lfg:stop:${snapshot.lfg.id}`, disabled: true },
+          ]
+          : [
+            primaryControl,
+            { type: 2, style: 4, label: "■ Stop", custom_id: `lfg:stop:${snapshot.lfg.id}` },
+          ],
     }];
   return {
     embeds: [{
@@ -459,7 +465,6 @@ async function component(i: DiscordInteraction, env: Env, ctx: ExecutionContext)
     if (state === "expired" || state === "stopped") return message("This LFG has already ended.", true);
     if (requested === "pause" && state !== "active") return message("This LFG is not active.", true);
     if (requested === "resume" && state !== "paused") return message("This LFG is not paused.", true);
-    if (i.message?.id) await saveLfgMessageId(env.DB, lfgId, i.message.id);
     ctx.waitUntil(completeLfgAction(env, i, lfgId, requested));
     return json({ type: ResponseType.UpdateMessage, data: lfgMessageData(snapshot, requested) });
   }
