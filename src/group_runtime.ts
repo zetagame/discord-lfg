@@ -1,12 +1,12 @@
 import { collectDeletedCustomGames } from "./games";
 import {
   beginControlSession,
-  clearControlSession,
-  finalizeControlSession,
+  cancelControlSessionOpening,
+  promoteControlSession,
   pruneControlSessions,
   refreshControlSessionToken,
-  restorePreviousControlSession,
-  type LfgControlSession,
+  takeControlSession,
+  type LfgControlReference,
   type PendingControlSession,
 } from "./control_sessions";
 import { lfgMemberLines } from "./discord_presence";
@@ -50,18 +50,33 @@ export async function handleLfgCommand(
     updates.push(await upsertGameMembership(env.DB, i.guild_id!, i.channel_id!, actor, game, expiresAt));
   }
   if (!updates.length) return ephemeral("Choose at least one game.");
-  ctx.waitUntil(afterMembershipUpdates(env, i, updates));
+
+  const first = updates[0];
+  const primarySession = i.application_id
+    ? await beginControlSession(env.DB, i.guild_id!, first.snapshot.game.id, actor, i.application_id, i.token)
+    : undefined;
+  ctx.waitUntil(afterMembershipUpdates(env, i, updates, actor, primarySession));
+
   return json({
     type: ResponseType.ChannelMessage,
-    data: { ...memberControlData(updates[0].snapshot.game, updates[0].member), flags: 64 },
+    data: { ...memberControlData(first.snapshot.game, first.member, undefined, Boolean(primarySession)), flags: 64 },
   });
 }
 
-async function afterMembershipUpdates(env: Env, i: DiscordInteraction, updates: MembershipUpdate[]): Promise<void> {
+async function afterMembershipUpdates(
+  env: Env,
+  i: DiscordInteraction,
+  updates: MembershipUpdate[],
+  actor: string,
+  primarySession?: PendingControlSession,
+): Promise<void> {
+  if (primarySession && i.application_id) {
+    await finalizeOriginalControl(env, i, updates[0].snapshot.game.id, actor, primarySession);
+  }
   for (const update of updates) await syncGamePanel(env, update.snapshot.group.guildId, update.snapshot.game.id, i.channel_id);
-  await notifyGroupOverlaps(env, i.channel_id!, userId(i)!, updates);
+  await notifyGroupOverlaps(env, i.channel_id!, actor, updates);
   for (const update of updates.slice(1)) {
-    await interactionFollowupData(i, memberControlData(update.snapshot.game, update.member));
+    await sendTrackedControlFollowup(env, i, update.snapshot.game, update.member, actor);
   }
 }
 
@@ -82,7 +97,8 @@ export async function handleGroupComponent(i: DiscordInteraction, env: Env, ctx:
     if (state === "missing" || state === "expired") return ephemeral(`You're not currently in **${snapshot.game.name}**. Use /lfg to join or extend the group.`);
     if (!i.application_id) return ephemeral("Could not open your LFG controls.");
     const session = await beginControlSession(env.DB, i.guild_id, gameId, actor, i.application_id, i.token);
-    ctx.waitUntil(finalizeManagePanel(env, i, gameId, actor, session));
+    if (!session) return ephemeral("Your LFG controls are already opening.");
+    ctx.waitUntil(finalizeOriginalControl(env, i, gameId, actor, session));
     return json({ type: ResponseType.ChannelMessage, data: { ...memberControlData(snapshot.game, member), flags: 64 } });
   }
 
@@ -94,7 +110,7 @@ export async function handleGroupComponent(i: DiscordInteraction, env: Env, ctx:
   return json({ type: ResponseType.UpdateMessage, data: memberControlData(snapshot.game, member, action) });
 }
 
-async function finalizeManagePanel(
+async function finalizeOriginalControl(
   env: Env,
   i: DiscordInteraction,
   gameId: string,
@@ -105,21 +121,82 @@ async function finalizeManagePanel(
   const messageId = await interactionOriginalMessageId(i.application_id, i.token);
   if (!messageId) {
     await deleteOriginalWebhookMessage(i.application_id, i.token);
-    await restorePreviousControlSession(env.DB, i.guild_id, gameId, actor, pending.nonce, pending.previous);
+    await cancelControlSessionOpening(env.DB, i.guild_id, gameId, actor, pending.nonce);
     return;
   }
-  const current = await finalizeControlSession(env.DB, i.guild_id, gameId, actor, pending.nonce, messageId);
-  if (!current) {
-    await deleteOriginalWebhookMessage(i.application_id, i.token);
-    return;
-  }
-  if (pending.previous?.messageId) {
-    const closed = await deleteStoredControlMessage(pending.previous);
-    if (!closed) {
-      await deleteOriginalWebhookMessage(i.application_id, i.token);
-      await restorePreviousControlSession(env.DB, i.guild_id, gameId, actor, pending.nonce, pending.previous);
+  await finishControlOpening(
+    env,
+    i.guild_id,
+    gameId,
+    actor,
+    pending,
+    messageId,
+    () => deleteOriginalWebhookMessage(i.application_id!, i.token),
+  );
+}
+
+async function sendTrackedControlFollowup(
+  env: Env,
+  i: DiscordInteraction,
+  game: Game,
+  member: GroupMember,
+  actor: string,
+): Promise<void> {
+  if (!i.application_id || !i.guild_id) return;
+  const pending = await beginControlSession(env.DB, i.guild_id, game.id, actor, i.application_id, i.token);
+  if (!pending) return;
+
+  let messageId: string | undefined;
+  try {
+    const response = await fetch(`https://discord.com/api/v10/webhooks/${i.application_id}/${i.token}?wait=true`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...memberControlData(game, member), flags: 64 }),
+    });
+    if (!response.ok) {
+      console.error("Discord tracked control followup failed", response.status, await response.text());
+      await cancelControlSessionOpening(env.DB, i.guild_id, game.id, actor, pending.nonce);
+      return;
     }
+    messageId = (await response.json() as { id?: string }).id;
+    if (!messageId) {
+      await cancelControlSessionOpening(env.DB, i.guild_id, game.id, actor, pending.nonce);
+      return;
+    }
+    await finishControlOpening(
+      env,
+      i.guild_id,
+      game.id,
+      actor,
+      pending,
+      messageId,
+      () => deleteWebhookMessage(i.application_id!, i.token, messageId!),
+    );
+  } catch (error) {
+    console.error("Discord tracked control followup request failed", error);
+    if (messageId) await deleteWebhookMessage(i.application_id, i.token, messageId);
+    await cancelControlSessionOpening(env.DB, i.guild_id, game.id, actor, pending.nonce);
   }
+}
+
+async function finishControlOpening(
+  env: Env,
+  guildId: string,
+  gameId: string,
+  actor: string,
+  pending: PendingControlSession,
+  messageId: string,
+  deleteNew: () => Promise<boolean>,
+): Promise<boolean> {
+  if (pending.previous && !await deleteStoredControlMessage(pending.previous)) {
+    await deleteNew();
+    await cancelControlSessionOpening(env.DB, guildId, gameId, actor, pending.nonce);
+    return false;
+  }
+  const promoted = await promoteControlSession(env.DB, guildId, gameId, actor, pending.nonce, messageId);
+  if (promoted) return true;
+  await deleteNew();
+  return false;
 }
 
 async function completeMemberAction(
@@ -132,10 +209,12 @@ async function completeMemberAction(
   try {
     const result = await mutateGameMembership(env.DB, i.guild_id!, game.id, actor, action);
     if (action === "stop") {
+      const current = await takeControlSession(env.DB, i.guild_id!, game.id, actor);
+      const clickedMessageId = i.message?.id;
       if (!await deleteInteractionOriginal(i)) {
-        await editInteractionOriginal(i, memberControlData(game, undefined));
+        await editInteractionOriginal(i, memberControlData(game, undefined, undefined, false));
       }
-      await clearControlSession(env.DB, i.guild_id!, game.id, actor, i.message?.id);
+      if (current && current.messageId !== clickedMessageId) await deleteStoredControlMessage(current);
     } else {
       await refreshControlSessionToken(env.DB, i.guild_id!, game.id, actor, i.message?.id, i.application_id, i.token);
       if (!await editInteractionOriginal(i, memberControlData(game, result.member))) {
@@ -157,6 +236,7 @@ function memberControlData(
   game: Game,
   member?: GroupMember,
   loadingAction?: "pause" | "resume" | "stop",
+  showControls = true,
 ): Record<string, unknown> {
   const state = groupMemberState(member);
   const status = loadingAction
@@ -167,7 +247,7 @@ function memberControlData(
   const primary = state === "paused"
     ? { type: 2, style: 1, label: "▶ Resume", custom_id: `group:resume:${game.id}` }
     : { type: 2, style: 1, label: "⏸ Pause", custom_id: `group:pause:${game.id}` };
-  const components = state === "active" || state === "paused"
+  const components = showControls && (state === "active" || state === "paused")
     ? [{
       type: 1,
       components: loadingAction === "stop"
@@ -401,16 +481,19 @@ async function interactionOriginalMessageId(applicationId: string, token: string
   return undefined;
 }
 
-async function deleteStoredControlMessage(session: LfgControlSession): Promise<boolean> {
-  if (!session.messageId) return true;
-  return deleteOriginalWebhookMessage(session.applicationId, session.interactionToken);
+async function deleteStoredControlMessage(session: LfgControlReference): Promise<boolean> {
+  return deleteWebhookMessage(session.applicationId, session.interactionToken, session.messageId);
 }
 
 async function deleteOriginalWebhookMessage(applicationId: string, token: string): Promise<boolean> {
+  return deleteWebhookMessage(applicationId, token, "@original");
+}
+
+async function deleteWebhookMessage(applicationId: string, token: string, messageId: string): Promise<boolean> {
   for (const delay of [0, 150, 500]) {
     if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
     try {
-      const response = await fetch(`https://discord.com/api/v10/webhooks/${applicationId}/${token}/messages/@original`, { method: "DELETE" });
+      const response = await fetch(`https://discord.com/api/v10/webhooks/${applicationId}/${token}/messages/${messageId}`, { method: "DELETE" });
       if (response.ok || response.status === 404) return true;
       if (![429, 500, 502, 503, 504].includes(response.status)) {
         console.error("Discord control message delete failed", response.status, await response.text());
@@ -442,29 +525,16 @@ async function editInteractionOriginal(i: DiscordInteraction, body: Record<strin
 
 async function deleteInteractionOriginal(i: DiscordInteraction): Promise<boolean> {
   if (!i.application_id) return false;
-  try {
-    const response = await fetch(`https://discord.com/api/v10/webhooks/${i.application_id}/${i.token}/messages/@original`, {
-      method: "DELETE",
-    });
-    if (!response.ok && response.status !== 404) console.error("Discord interaction delete failed", response.status, await response.text());
-    return response.ok || response.status === 404;
-  } catch (error) {
-    console.error("Discord interaction delete request failed", error);
-    return false;
-  }
+  return deleteOriginalWebhookMessage(i.application_id, i.token);
 }
 
 async function interactionFollowup(i: DiscordInteraction, content: string): Promise<void> {
-  await interactionFollowupData(i, { content });
-}
-
-async function interactionFollowupData(i: DiscordInteraction, data: Record<string, unknown>): Promise<void> {
   if (!i.application_id) return;
   try {
     const response = await fetch(`https://discord.com/api/v10/webhooks/${i.application_id}/${i.token}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ ...data, flags: 64 }),
+      body: JSON.stringify({ content, flags: 64 }),
     });
     if (!response.ok) console.error("Discord interaction followup failed", response.status, await response.text());
   } catch (error) {
