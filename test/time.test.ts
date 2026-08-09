@@ -14,5 +14,13 @@ test("scheduled local time is stored as UTC", () => {
 test("lfg default duration is two hours when supplied by caller", () => {
   const now = new Date("2026-01-01T00:00:00Z");
   assert.equal(new Date(now.getTime() + 2 * 3_600_000).toISOString(), "2026-01-01T02:00:00.000Z");
-  assert.equal(parseDuration("2h", now)?.toISOString(), "2026-01-01T02:00:00.000Z");
+  assert.equal(parseDuration("2h", "America/New_York", now)?.toISOString(), "2026-01-01T02:00:00.000Z");
+});
+
+test("calendar durations use the effective timezone across DST", () => {
+  const now = new Date("2026-03-08T04:00:00.000Z"); // March 7, 11pm in New York
+  assert.equal(parseDuration("today", "America/New_York", now)?.toISOString(), "2026-03-08T04:59:59.999Z");
+  assert.equal(parseDuration("tonight", "America/New_York", now)?.toISOString(), "2026-03-09T01:00:00.000Z");
+  assert.equal(parseDuration("tomorrow", "America/New_York", now)?.toISOString(), "2026-03-09T03:59:59.999Z");
+  assert.equal(parseWhen("until 10pm", "America/New_York", now)?.toISOString(), "2026-03-09T02:00:00.000Z");
 });
