@@ -215,6 +215,9 @@ async function completeMemberAction(
       .catch((error) => console.error("Write-complete LFG panel projection failed", error));
     const manager = await loadManagedLfgs(env.DB, i.guild_id!, actor);
 
+    // Keep one authoritative manager alive while any LFG remains. A new manager
+    // supersedes it through the control-session opening path above; only the last
+    // Stop removes the current manager.
     if (!manager.length) {
       const current = await takeControlSession(env.DB, i.guild_id!, actor);
       const clickedMessageId = i.message?.id;
@@ -249,7 +252,7 @@ function managerData(
     { type: 10, content: "### Your LFGs" },
   ];
 
-  for (const { game, member } of visible) {
+  for (const [index, { game, member }] of visible.entries()) {
     const state = groupMemberState(member);
     const loadingThis = loading?.gameId === game.id;
     const primaryLabel = state === "paused" ? "▶ Resume" : "⏸ Pause";
@@ -263,27 +266,31 @@ function managerData(
         : `Looking until ${discordTimestamp(new Date(member.expiresAt))}`;
 
     components.push({
-      type: 9,
-      components: [{ type: 10, content: `**${game.name}**` }],
-      accessory: {
-        type: 2,
-        style: 2,
-        label: loadingThis && loading?.action !== "stop" ? `⏳ ${status}` : primaryLabel,
-        custom_id: loadingThis ? `group:busy:${game.id}` : `group:${primaryAction}:${game.id}`,
-        disabled: loadingThis || !showControls,
-      },
+      type: 10,
+      content: `**${game.name}**\n-# ${status}`,
     });
     components.push({
-      type: 9,
-      components: [{ type: 10, content: `-# ${status}` }],
-      accessory: {
-        type: 2,
-        style: 4,
-        label: loadingThis && loading?.action === "stop" ? "⏳ Stopping…" : "■ Stop",
-        custom_id: loadingThis ? `group:busy:${game.id}` : `group:stop:${game.id}`,
-        disabled: loadingThis || !showControls,
-      },
+      type: 1,
+      components: [
+        {
+          type: 2,
+          style: 2,
+          label: loadingThis && loading?.action !== "stop" ? `⏳ ${status}` : primaryLabel,
+          custom_id: loadingThis ? `group:busy:${game.id}` : `group:${primaryAction}:${game.id}`,
+          disabled: loadingThis || !showControls,
+        },
+        {
+          type: 2,
+          style: 4,
+          label: loadingThis && loading?.action === "stop" ? "⏳ Stopping…" : "■ Stop",
+          custom_id: loadingThis ? `group:busy:${game.id}` : `group:stop:${game.id}`,
+          disabled: loadingThis || !showControls,
+        },
+      ],
     });
+    if (index < visible.length - 1) {
+      components.push({ type: 14, divider: true, spacing: 1 });
+    }
   }
 
   if (managed.length > visible.length) {
