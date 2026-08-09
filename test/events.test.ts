@@ -20,14 +20,15 @@ function triggerDb(type: "yes_rsvps" | "yes-or-maybe_rsvps", count: number) {
   return {
     state: () => ({ fired, activations }),
     prepare(sql: string) {
+      const statement = sql.trimStart();
       return {
         bind: () => ({
           first: async () => {
-            if (sql.startsWith("SELECT type")) return { type, threshold: 2, fired_at: fired ? "2026-01-01T00:00:00.000Z" : undefined };
+            if (statement.startsWith("SELECT type")) return { type, threshold: 2, fired_at: fired ? "2026-01-01T00:00:00.000Z" : undefined };
             return { count };
           },
           run: async () => {
-            if (sql.startsWith("UPDATE")) {
+            if (statement.startsWith("UPDATE")) {
               if (fired) return { meta: { changes: 0 } };
               fired = true;
               return { meta: { changes: 1 } };

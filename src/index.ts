@@ -2,7 +2,14 @@ import { collectDeletedCustomGames, IgdbProvider, GameSelectionService } from ".
 import { handleGroupComponent, handleLfgCommand, syncGamePanelsForEvent, syncSharedGameGroups } from "./group_runtime";
 import { InteractionType, ResponseType, json, option, userId, verifyDiscordRequest } from "./discord";
 import { canonicalTimeZone, discordTimestamp, effectiveTimeZone, parseWhen } from "./time";
-import { dueDeliveries, fireRsvpTrigger } from "./events";
+import {
+  claimActiveEventDelivery,
+  dueDeliveries,
+  eventIsActive,
+  fireRsvpTrigger,
+  releaseEventDeliveryClaim,
+  type EventDeliveryKind,
+} from "./events";
 import type { DiscordInteraction, Env, Game } from "./types";
 
 const gameOption = { name: "games", description: "Games", type: 3, required: true, autocomplete: true };
@@ -36,7 +43,6 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/commands") return json(commands);
-    if (request.method === "GET" && url.pathname === "/register-commands") return registerCommands(env);
     if (request.method !== "POST") return new Response("Not found", { status: 404 });
 
     const interaction = await verifyDiscordRequest(request, env.DISCORD_PUBLIC_KEY);
@@ -58,21 +64,6 @@ export default {
     await collectDeletedCustomGames(env.DB);
   },
 } satisfies ExportedHandler<Env>;
-
-async function registerCommands(env: Env): Promise<Response> {
-  if (!env.DISCORD_BOT_TOKEN) return new Response("DISCORD_BOT_TOKEN is not configured.", { status: 500 });
-  const headers = { authorization: `Bot ${env.DISCORD_BOT_TOKEN}`, "content-type": "application/json" };
-  const appResponse = await fetch("https://discord.com/api/v10/oauth2/applications/@me", { headers });
-  if (!appResponse.ok) return new Response(`Could not identify Discord application (${appResponse.status}).`, { status: 502 });
-  const application = await appResponse.json() as { id: string };
-  const response = await fetch(`https://discord.com/api/v10/applications/${application.id}/commands`, {
-    method: "PUT",
-    headers,
-    body: JSON.stringify(commands),
-  });
-  if (!response.ok) return new Response(`Discord registration failed (${response.status}).`, { status: 502 });
-  return new Response("Registered /lfg and /create. This temporary endpoint can now be removed.");
-}
 
 async function autocomplete(interaction: DiscordInteraction, games: GameSelectionService): Promise<Response> {
   const focused = interaction.data?.options?.find((item) => item.focused);
@@ -152,8 +143,13 @@ async function createEvent(i: DiscordInteraction, env: Env, games: Game[], actor
   return json({ type: ResponseType.ChannelMessage, data: await eventMessageData(env.DB, id, i.guild_id!) });
 }
 
-async function eventMessageData(db: D1Database, eventId: string, guildId: string): Promise<Record<string, unknown>> {
-  const event = await db.prepare("SELECT id, title, starts_at, when_input FROM events WHERE id = ? AND guild_id = ?")
+async function eventMessageData(
+  db: D1Database,
+  eventId: string,
+  guildId: string,
+  deleting = false,
+): Promise<Record<string, unknown>> {
+  const event = await db.prepare("SELECT id, title, starts_at, when_input FROM events WHERE id = ? AND guild_id = ? AND deleted_at IS NULL")
     .bind(eventId, guildId).first<{ id: string; title: string; starts_at?: string; when_input?: string }>();
   if (!event) throw new Error("Event not found.");
 
@@ -187,11 +183,11 @@ async function eventMessageData(db: D1Database, eventId: string, guildId: string
       ],
       thumbnail: coverUrl ? { url: coverUrl } : undefined,
     }],
-    components: eventComponents(eventId, games.results),
+    components: eventComponents(eventId, games.results, deleting),
   };
 }
 
-function eventComponents(eventId: string, games: Game[]): unknown[] {
+function eventComponents(eventId: string, games: Game[], disabled = false): unknown[] {
   const components: unknown[] = [{
     type: 1,
     components: [["yes", 3], ["maybe", 2], ["no", 4]].map(([status, style]) => ({
@@ -199,6 +195,7 @@ function eventComponents(eventId: string, games: Game[]): unknown[] {
       style,
       label: String(status).replace(/^./, (letter) => letter.toUpperCase()),
       custom_id: `rsvp:${eventId}:${status}`,
+      disabled,
     })),
   }];
   if (games.length > 1) {
@@ -211,9 +208,20 @@ function eventComponents(eventId: string, games: Game[]): unknown[] {
         min_values: 1,
         max_values: games.length,
         options: games.map((game) => ({ label: game.name, value: game.id })),
+        disabled,
       }],
     });
   }
+  components.push({
+    type: 1,
+    components: [{
+      type: 2,
+      style: 4,
+      label: disabled ? "⏳ Deleting…" : "Delete event",
+      custom_id: `event-delete:${eventId}`,
+      disabled,
+    }],
+  });
   return components;
 }
 
@@ -315,9 +323,25 @@ async function component(i: DiscordInteraction, env: Env, ctx: ExecutionContext)
     return message("Invalid timezone action.", true);
   }
 
+  if (action === "event-delete") {
+    const eventId = parts[1];
+    const actor = userId(i);
+    if (!eventId || !actor || !i.guild_id) return message("Invalid event deletion.", true);
+    const event = await env.DB.prepare(`
+      SELECT id, author_id AS authorId, channel_id AS channelId, deleted_at AS deletedAt
+      FROM events WHERE id = ? AND guild_id = ?
+    `).bind(eventId, i.guild_id).first<{ id: string; authorId: string; channelId: string; deletedAt?: string }>();
+    if (!event || event.deletedAt) return message("This event has already been deleted.", true);
+    if (event.authorId !== actor && !canManageGuild(i)) return message("Only the event creator or a server manager can delete this event.", true);
+    const deleting = await eventMessageData(env.DB, eventId, i.guild_id, true);
+    ctx.waitUntil(completeEventDelete(env, i, eventId, event.channelId));
+    return json({ type: ResponseType.UpdateMessage, data: deleting });
+  }
+
   const [, eventId, status] = parts;
   if (!eventId) return message("Invalid event action.", true);
-  const event = await env.DB.prepare("SELECT id FROM events WHERE id = ? AND guild_id = ?").bind(eventId, i.guild_id).first();
+  const event = await env.DB.prepare("SELECT id FROM events WHERE id = ? AND guild_id = ? AND deleted_at IS NULL")
+    .bind(eventId, i.guild_id).first();
   if (!event) return message("This event is not available in this server.", true);
   if ((action === "rsvp" || action === "vote") && !await eventAcceptsChanges(env.DB, eventId)) {
     return message("This event is no longer accepting changes.", true);
@@ -348,11 +372,50 @@ async function component(i: DiscordInteraction, env: Env, ctx: ExecutionContext)
   return message("Invalid event action.", true);
 }
 
+async function completeEventDelete(env: Env, i: DiscordInteraction, eventId: string, channelId: string): Promise<void> {
+  let deleted = false;
+  try {
+    const result = await env.DB.prepare(`
+      UPDATE events SET deleted_at = ?
+      WHERE id = ? AND guild_id = ? AND deleted_at IS NULL
+    `).bind(new Date().toISOString(), eventId, i.guild_id).run();
+    deleted = Boolean(result.meta.changes);
+  } catch (error) {
+    console.error("Event deletion mutation failed", error);
+    if (i.message?.id && i.guild_id) {
+      try {
+        await editDiscordMessage(env, channelId, i.message.id, await eventMessageData(env.DB, eventId, i.guild_id));
+      } catch {
+        // Nothing safe to restore.
+      }
+    }
+    await interactionFollowup(i, error instanceof Error ? error.message : "Could not delete that event.");
+    return;
+  }
+  if (!deleted) return;
+
+  try {
+    await syncGamePanelsForEvent(env, eventId, false);
+  } catch (error) {
+    console.error("Event panel sync after deletion failed", error);
+  }
+  try {
+    await collectDeletedCustomGames(env.DB);
+  } catch (error) {
+    console.error("Custom-game collection after event deletion failed", error);
+  }
+
+  if (i.message?.id && await deleteDiscordMessage(env, channelId, i.message.id)) return;
+  if (i.message?.id) {
+    await editDiscordMessage(env, channelId, i.message.id, { content: "Event deleted.", embeds: [], components: [] });
+  }
+}
+
 async function eventAcceptsChanges(db: D1Database, eventId: string): Promise<boolean> {
   const event = await db.prepare(`
     SELECT events.starts_at, event_triggers.fired_at
     FROM events LEFT JOIN event_triggers ON event_triggers.event_id = events.id
-    WHERE events.id = ?
+    WHERE events.id = ? AND events.deleted_at IS NULL
   `).bind(eventId).first<{ starts_at?: string; fired_at?: string }>();
   if (!event) return false;
   if (event.starts_at) return new Date(event.starts_at).getTime() > Date.now();
@@ -382,7 +445,7 @@ async function sendScheduledNotifications(env: Env, now = new Date()): Promise<v
   const events = await env.DB.prepare(`
     SELECT events.id, events.channel_id, events.title, events.starts_at, rsvps.user_id, rsvps.status
     FROM events JOIN rsvps ON rsvps.event_id = events.id
-    WHERE events.starts_at IS NOT NULL AND events.starts_at <= ?
+    WHERE events.deleted_at IS NULL AND events.starts_at IS NOT NULL AND events.starts_at <= ?
   `).bind(new Date(now.getTime() + 3_600_000).toISOString()).all<{
     id: string;
     channel_id: string;
@@ -408,7 +471,7 @@ async function onEventActivated(env: Env, eventId: string): Promise<void> {
 }
 
 async function notifyActivation(env: Env, eventId: string): Promise<void> {
-  const event = await env.DB.prepare("SELECT channel_id, title FROM events WHERE id = ?").bind(eventId)
+  const event = await env.DB.prepare("SELECT channel_id, title FROM events WHERE id = ? AND deleted_at IS NULL").bind(eventId)
     .first<{ channel_id: string; title: string }>();
   if (event) await deliver(env, eventId, "", "activation", event.channel_id, `**${event.title}** is now active.`);
 }
@@ -417,22 +480,27 @@ async function deliver(
   env: Env,
   eventId: string,
   userIdValue: string,
-  kind: "reminder" | "start" | "activation",
+  kind: EventDeliveryKind,
   channelId: string,
   content: string,
 ): Promise<void> {
   if (!env.DISCORD_BOT_TOKEN) return;
-  const claimed = await env.DB.prepare("INSERT OR IGNORE INTO event_deliveries (event_id, user_id, kind, delivered_at) VALUES (?, ?, ?, ?)")
-    .bind(eventId, userIdValue, kind, new Date().toISOString()).run();
-  if (!claimed.meta.changes) return;
+  const claimed = await claimActiveEventDelivery(env.DB, eventId, userIdValue, kind);
+  if (!claimed) return;
+
+  // The due-event query and delivery claim can both race an event deletion.
+  // Re-read immediately before the network side effect; if deletion won, drop
+  // the claim so there is no stale reminder/start/activation to retry later.
+  if (!await eventIsActive(env.DB, eventId)) {
+    await releaseEventDeliveryClaim(env.DB, eventId, userIdValue, kind);
+    return;
+  }
+
   const response = await postChannelMessage(env, channelId, {
     content,
     allowed_mentions: userIdValue ? { users: [userIdValue] } : { parse: [] },
   });
-  if (!response?.ok) {
-    await env.DB.prepare("DELETE FROM event_deliveries WHERE event_id = ? AND user_id = ? AND kind = ?")
-      .bind(eventId, userIdValue, kind).run();
-  }
+  if (!response?.ok) await releaseEventDeliveryClaim(env.DB, eventId, userIdValue, kind);
 }
 
 async function postChannelMessage(env: Env, channelId: string, body: Record<string, unknown>): Promise<Response | undefined> {
@@ -444,6 +512,51 @@ async function postChannelMessage(env: Env, channelId: string, body: Record<stri
   });
   if (!response.ok) console.error("Discord channel message failed", response.status, await response.text());
   return response;
+}
+
+async function deleteDiscordMessage(env: Env, channelId: string, messageId: string): Promise<boolean> {
+  if (!env.DISCORD_BOT_TOKEN) return false;
+  try {
+    const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages/${messageId}`, {
+      method: "DELETE",
+      headers: { authorization: `Bot ${env.DISCORD_BOT_TOKEN}` },
+    });
+    if (!response.ok && response.status !== 404) console.error("Discord event message delete failed", response.status, await response.text());
+    return response.ok || response.status === 404;
+  } catch (error) {
+    console.error("Discord event message delete request failed", error);
+    return false;
+  }
+}
+
+async function editDiscordMessage(env: Env, channelId: string, messageId: string, body: Record<string, unknown>): Promise<boolean> {
+  if (!env.DISCORD_BOT_TOKEN) return false;
+  try {
+    const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages/${messageId}`, {
+      method: "PATCH",
+      headers: { authorization: `Bot ${env.DISCORD_BOT_TOKEN}`, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) console.error("Discord event message edit failed", response.status, await response.text());
+    return response.ok;
+  } catch (error) {
+    console.error("Discord event message edit request failed", error);
+    return false;
+  }
+}
+
+async function interactionFollowup(i: DiscordInteraction, content: string): Promise<void> {
+  if (!i.application_id) return;
+  try {
+    const response = await fetch(`https://discord.com/api/v10/webhooks/${i.application_id}/${i.token}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ content, flags: 64 }),
+    });
+    if (!response.ok) console.error("Discord interaction followup failed", response.status, await response.text());
+  } catch (error) {
+    console.error("Discord interaction followup request failed", error);
+  }
 }
 
 function message(content: string, ephemeral: boolean): Response {
