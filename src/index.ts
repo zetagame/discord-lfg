@@ -1,5 +1,16 @@
 import { collectDeletedCustomGames, IgdbProvider, GameSelectionService } from "./games";
-import { currentListenedGames, matchingLfgCreators, matchingListeners, recordNotificationAction } from "./notifications";
+import {
+  activeUsersByGame,
+  createLfg,
+  expiredUnfinalizedLfgs,
+  lfgSnapshot,
+  lfgState,
+  markLfgFinalized,
+  mutateLfg,
+  refreshableLfgsForGames,
+  saveLfgMessageId,
+  type LfgSnapshot,
+} from "./lfg";
 import { InteractionType, ResponseType, json, option, userId, verifyDiscordRequest } from "./discord";
 import { canonicalTimeZone, discordTimestamp, effectiveTimeZone, parseWhen } from "./time";
 import { dueDeliveries, fireRsvpTrigger } from "./events";
@@ -8,10 +19,7 @@ import type { DiscordInteraction, Env, Game } from "./types";
 const gameOption = { name: "games", description: "Games", type: 3, required: true, autocomplete: true };
 const durationOption = { name: "duration", description: "Duration", type: 3 };
 const commands = [
-  { name: "listen", description: "Listen for game alerts", options: [gameOption, durationOption] },
-  { name: "unlisten", description: "Stop game alerts", options: [gameOption, durationOption] },
-  { name: "mute", description: "Stop game alerts", options: [gameOption, durationOption] },
-  { name: "lfg", description: "Post a looking-for-group alert", options: [gameOption, durationOption] },
+  { name: "lfg", description: "Look for people to play with", options: [gameOption, durationOption] },
   { name: "create", description: "Create a game event", options: [gameOption, { name: "when", description: "When", type: 3, required: true }] },
 ];
 
@@ -33,14 +41,16 @@ const timezoneOptions = [
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    if (request.method === "GET" && new URL(request.url).pathname === "/commands") return json(commands);
+    const url = new URL(request.url);
+    if (request.method === "GET" && url.pathname === "/commands") return json(commands);
+    if (request.method === "GET" && url.pathname === "/register-commands") return registerCommands(env);
     if (request.method !== "POST") return new Response("Not found", { status: 404 });
     const interaction = await verifyDiscordRequest(request, env.DISCORD_PUBLIC_KEY);
     if (!interaction) return new Response("Invalid request signature", { status: 401 });
     if (interaction.type === InteractionType.Ping) return json({ type: ResponseType.Pong });
     if (!interaction.guild_id || !interaction.channel_id || !userId(interaction)) return message("Use this command in a server channel.", true);
     const games = new GameSelectionService(env.DB, getIgdbProvider(env));
-    if (interaction.type === InteractionType.Autocomplete) return autocomplete(interaction, env, games);
+    if (interaction.type === InteractionType.Autocomplete) return autocomplete(interaction, games);
     if (interaction.type === InteractionType.Component) return component(interaction, env, ctx);
     if (interaction.type === InteractionType.ApplicationCommand) return command(interaction, env, games, ctx);
     if (interaction.type === InteractionType.ModalSubmit) return component(interaction, env, ctx);
@@ -48,28 +58,40 @@ export default {
   },
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
     await sendScheduledNotifications(env);
+    await finalizeExpiredLfgs(env);
     await collectDeletedCustomGames(env.DB);
   },
 } satisfies ExportedHandler<Env>;
 
-async function autocomplete(interaction: DiscordInteraction, env: Env, games: GameSelectionService): Promise<Response> {
+async function registerCommands(env: Env): Promise<Response> {
+  if (!env.DISCORD_BOT_TOKEN) return new Response("DISCORD_BOT_TOKEN is not configured.", { status: 500 });
+  const headers = { authorization: `Bot ${env.DISCORD_BOT_TOKEN}`, "content-type": "application/json" };
+  const appResponse = await fetch("https://discord.com/api/v10/oauth2/applications/@me", { headers });
+  if (!appResponse.ok) return new Response(`Could not identify Discord application (${appResponse.status}).`, { status: 502 });
+  const application = await appResponse.json() as { id: string };
+  const response = await fetch(`https://discord.com/api/v10/applications/${application.id}/commands`, {
+    method: "PUT",
+    headers,
+    body: JSON.stringify(commands),
+  });
+  if (!response.ok) return new Response(`Discord registration failed (${response.status}).`, { status: 502 });
+  return new Response("Registered /lfg and /create. This temporary endpoint can now be removed.");
+}
+
+async function autocomplete(interaction: DiscordInteraction, games: GameSelectionService): Promise<Response> {
   const focused = interaction.data?.options?.find((item) => item.focused);
   const parts = String(focused?.value ?? "").split(",");
   const query = parts.at(-1)?.trim() ?? "";
   const selectedNames = parts.slice(0, -1).map((part) => part.trim()).filter(Boolean);
   const prefix = selectedNames.join(", ");
-  const actor = userId(interaction)!;
-  const managesListens = interaction.data?.name === "unlisten" || interaction.data?.name === "mute";
-  const choices = managesListens
-    ? await currentListenedGames(env.DB, interaction.guild_id!, actor, query)
-    : await games.search(interaction.guild_id!, query);
+  const choices = await games.search(interaction.guild_id!, query);
   const filtered = choices.filter((game) => !selectedNames.some((name) => name.toLowerCase() === game.name.toLowerCase()));
-  if (!managesListens && query && !filtered.some((game) => game.name.toLowerCase() === query.toLowerCase())) {
+  if (query && !filtered.some((game) => game.name.toLowerCase() === query.toLowerCase())) {
     filtered.push({ id: "custom", name: `Use "${query}"` });
   }
   return json({ type: ResponseType.Autocomplete, data: { choices: filtered.slice(0, 25).map((game) => {
     const customFallback = game.id === "custom";
-    const suffix = game.deletedAt ? " · removed" : !customFallback && !game.providerId ? " · custom" : "";
+    const suffix = !customFallback && !game.providerId ? " · custom" : "";
     return {
       name: `${game.name}${suffix}`.slice(0, 100),
       value: prefix
@@ -83,12 +105,7 @@ async function command(i: DiscordInteraction, env: Env, games: GameSelectionServ
   const name = i.data?.name;
   const actor = userId(i)!;
   try {
-    const input = String(option(i, "games") ?? "");
-    const selected = name === "unlisten" || name === "mute"
-      ? await resolveCurrentListens(env.DB, i.guild_id!, actor, input)
-      : await games.resolve(i.guild_id!, input, actor);
-    if (name === "listen") return listen(i, env, selected, "listen", actor, ctx);
-    if (name === "unlisten" || name === "mute") return listen(i, env, selected, "unlisten", actor, ctx);
+    const selected = await games.resolve(i.guild_id!, String(option(i, "games") ?? ""), actor);
     if (name === "lfg") return lfg(i, env, selected, actor, ctx);
     if (name === "create") return createEvent(i, env, selected, actor, ctx);
   } catch (error) {
@@ -106,92 +123,226 @@ function canManageGuild(i: DiscordInteraction): boolean {
   }
 }
 
-async function resolveCurrentListens(db: D1Database, guildId: string, actor: string, input: string): Promise<Game[]> {
-  const requested = [...new Set(input.split(",").map((name) => name.trim()).filter(Boolean))];
-  if (!requested.length) throw new Error("Choose one of your current listens.");
-  const current = await currentListenedGames(db, guildId, actor);
-  return requested.map((name) => {
-    const game = current.find((candidate) => candidate.name.toLowerCase() === name.toLowerCase());
-    if (!game) throw new Error(`You are not currently listening for ${name}.`);
-    return game;
-  });
-}
-
-async function listen(
-  i: DiscordInteraction,
-  env: Env,
-  games: Game[],
-  action: "listen" | "unlisten",
-  actor: string,
-  ctx: ExecutionContext,
-): Promise<Response> {
+async function lfg(i: DiscordInteraction, env: Env, games: Game[], actor: string, ctx: ExecutionContext): Promise<Response> {
   const userZone = await userTimeZone(env.DB, i.guild_id!, actor);
-  const timeZone = userZone.timeZone;
-  const duration = parseWhen(String(option(i, "duration") ?? ""), timeZone);
-  if (option(i, "duration") && !duration) return message("Use a duration such as 30m, 2h, 3d, tonight, or this weekend.", true);
-  const previouslyListening = action === "listen" ? await currentListenedGames(env.DB, i.guild_id!, actor) : [];
-  await recordNotificationAction(env.DB, i.guild_id!, actor, games.map((game) => game.id), action, duration);
-  if (action === "listen") {
-    const newGames = games.filter((game) => !previouslyListening.some((current) => current.id === game.id));
-    if (newGames.length) ctx.waitUntil(notifyNewListenMatches(env, i.guild_id!, i.channel_id!, actor, newGames));
-  } else {
-    ctx.waitUntil(collectDeletedCustomGames(env.DB));
-  }
-  const word = action === "listen" ? "Listening for" : "Not listening for";
-  const content = `${word} ${gameNames(games)}${duration ? ` until ${discordTimestamp(duration)}` : ""}.`;
-  const deleteRows = customGameDeleteComponents(i, games, userZone.shouldPrompt ? 4 : 5);
-  const components = userZone.shouldPrompt ? [timezoneComponent(), ...deleteRows] : deleteRows;
-  if (userZone.shouldPrompt) {
-    await env.DB.prepare(
-      "INSERT INTO users (guild_id, user_id, timezone_prompted_at) VALUES (?, ?, ?) ON CONFLICT(guild_id, user_id) DO UPDATE SET timezone_prompted_at = excluded.timezone_prompted_at",
-    ).bind(i.guild_id, actor, new Date().toISOString()).run();
-  }
-  return json({ type: ResponseType.ChannelMessage, data: {
-    content,
-    flags: 64,
-    components: components.length ? components : undefined,
-  } });
+  const duration = option(i, "duration")
+    ? parseWhen(String(option(i, "duration")), userZone.timeZone)
+    : new Date(Date.now() + 2 * 3_600_000);
+  if (!duration) return message("Use a duration such as 30m, 2h, 3d, tonight, or this weekend.", true);
+  if (userZone.shouldPrompt) await markTimezonePrompted(env.DB, i.guild_id!, actor);
+
+  const created = await createLfg(env.DB, i.guild_id!, i.channel_id!, actor, games, duration);
+  const snapshot = await lfgSnapshot(env.DB, i.guild_id!, created.id);
+  if (!snapshot) throw new Error("Could not create this LFG.");
+  ctx.waitUntil(afterLfgCreated(env, i, snapshot, created.newlyOverlappingGameIds, created.recipients, userZone.shouldPrompt));
+  return json({ type: ResponseType.ChannelMessage, data: lfgMessageData(snapshot) });
 }
 
-async function notifyNewListenMatches(env: Env, guildId: string, channelId: string, actor: string, games: Game[]): Promise<void> {
-  const gameIds = games.map((game) => game.id);
-  const [listeners, lfgCreators] = await Promise.all([
-    matchingListeners(env.DB, guildId, gameIds, actor),
-    matchingLfgCreators(env.DB, guildId, gameIds, actor),
-  ]);
-  const recipients = [...new Set([...listeners, ...lfgCreators])];
-  if (!recipients.length) return;
+function lfgMessageData(snapshot: LfgSnapshot, loadingAction?: "pause" | "resume" | "stop"): Record<string, unknown> {
+  const state = lfgState(snapshot.lfg);
+  const coverUrl = snapshot.games.find((game) => game.coverUrl)?.coverUrl;
+  const status = loadingAction
+    ? `${loadingAction === "pause" ? "Pausing" : loadingAction === "resume" ? "Resuming" : "Stopping"}…`
+    : state === "active" ? "Looking"
+      : state === "paused" ? "Paused"
+        : state === "stopped" ? "Stopped"
+          : "Expired";
+  const primaryControl = state === "paused"
+    ? { type: 2, style: 1, label: "▶ Resume", custom_id: `lfg:resume:${snapshot.lfg.id}` }
+    : { type: 2, style: 1, label: "⏸ Pause", custom_id: `lfg:pause:${snapshot.lfg.id}` };
+  const components = state === "stopped" || state === "expired"
+    ? []
+    : [{
+      type: 1,
+      components: loadingAction === "stop"
+        ? [
+          { ...primaryControl, disabled: true },
+          { type: 2, style: 4, label: "⏳ Stopping…", custom_id: `lfg:busy:${snapshot.lfg.id}`, disabled: true },
+        ]
+        : loadingAction
+          ? [
+            { type: 2, style: 1, label: `⏳ ${status}`, custom_id: `lfg:busy:${snapshot.lfg.id}`, disabled: true },
+            { type: 2, style: 4, label: "■ Stop", custom_id: `lfg:stop:${snapshot.lfg.id}`, disabled: true },
+          ]
+          : [
+            primaryControl,
+            { type: 2, style: 4, label: "■ Stop", custom_id: `lfg:stop:${snapshot.lfg.id}` },
+          ],
+    }];
+  return {
+    embeds: [{
+      title: `LFG: ${gameNames(snapshot.games)}`,
+      description: `${status} · until ${discordTimestamp(new Date(snapshot.lfg.expiresAt))}`,
+      fields: snapshot.games.slice(0, 25).map((game) => ({
+        name: game.name,
+        value: `${snapshot.counts.get(game.id) ?? 0} available`,
+        inline: true,
+      })),
+      thumbnail: coverUrl ? { url: coverUrl } : undefined,
+    }],
+    components,
+  };
+}
+
+async function afterLfgCreated(
+  env: Env,
+  i: DiscordInteraction,
+  snapshot: LfgSnapshot,
+  newlyOverlappingGameIds: string[],
+  recipients: string[],
+  shouldPromptTimezone: boolean,
+): Promise<void> {
+  await captureOriginalLfgMessage(env.DB, i, snapshot.lfg.id);
+  const gameIds = snapshot.games.map((game) => game.id);
+  await refreshLfgCardsForGames(env, snapshot.lfg.guildId, gameIds);
+  await notifyLfgOverlap(
+    env,
+    snapshot.lfg.guildId,
+    snapshot.lfg.channelId,
+    snapshot.lfg.authorId,
+    snapshot.games,
+    newlyOverlappingGameIds,
+    recipients,
+  );
+  await sendPostCommandControls(i, snapshot.games, shouldPromptTimezone);
+}
+
+async function captureOriginalLfgMessage(db: D1Database, i: DiscordInteraction, lfgId: string): Promise<void> {
+  if (!i.application_id) return;
+  const waits = [0, 100, 250, 500];
+  for (const wait of waits) {
+    if (wait) await new Promise((resolve) => setTimeout(resolve, wait));
+    const response = await fetch(`https://discord.com/api/v10/webhooks/${i.application_id}/${i.token}/messages/@original`);
+    if (!response.ok) continue;
+    const body = await response.json() as { id?: string };
+    if (body.id) {
+      await saveLfgMessageId(db, lfgId, body.id);
+      return;
+    }
+  }
+  console.warn("Could not capture LFG Discord message id", lfgId);
+}
+
+async function notifyLfgOverlap(
+  env: Env,
+  guildId: string,
+  channelId: string,
+  actor: string,
+  games: Game[],
+  gameIds: string[],
+  recipients: string[],
+): Promise<void> {
+  if (!gameIds.length || !recipients.length) return;
+  const selected = games.filter((game) => gameIds.includes(game.id));
+  const active = await activeUsersByGame(env.DB, guildId, gameIds);
   const mentions = recipients.map((uid) => `<@${uid}>`).join(" ");
+  const counts = selected.map((game) => `**${game.name}** — ${active.get(game.id)?.length ?? 0} available`).join("\n");
   await postChannelMessage(env, channelId, {
-    content: `${mentions} New match: <@${actor}> is now listening for ${gameNames(games)}.`,
+    content: `${mentions} New overlap with <@${actor}>:\n${counts}`,
     allowed_mentions: { users: recipients },
   });
 }
 
-async function lfg(i: DiscordInteraction, env: Env, games: Game[], actor: string, ctx: ExecutionContext): Promise<Response> {
-  const userZone = await userTimeZone(env.DB, i.guild_id!, actor);
-  const timeZone = userZone.timeZone;
-  const duration = option(i, "duration") ? parseWhen(String(option(i, "duration")), timeZone) : new Date(Date.now() + 2 * 3_600_000);
-  if (!duration) return message("Use a duration such as 30m, 2h, 3d, tonight, or this weekend.", true);
-  const id = crypto.randomUUID();
-  await env.DB.batch([
-    env.DB.prepare("INSERT INTO lfgs (id, guild_id, channel_id, author_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)")
-      .bind(id, i.guild_id, i.channel_id, actor, duration.toISOString(), new Date().toISOString()),
-    ...games.map((game) => env.DB.prepare("INSERT INTO lfg_games (lfg_id, game_id) VALUES (?, ?)").bind(id, game.id)),
-  ]);
-  const listeners = await matchingListeners(env.DB, i.guild_id!, games.map((game) => game.id), actor);
-  const mentions = listeners.map((uid) => `<@${uid}>`).join(" ");
-  const coverUrl = games.find((game) => game.coverUrl)?.coverUrl;
-  ctx.waitUntil(sendCustomGameControls(i, games));
-  return json({ type: ResponseType.ChannelMessage, data: {
-    content: mentions || undefined,
-    embeds: [{
-      title: `LFG: ${gameNames(games)}`,
-      description: `Available until ${discordTimestamp(duration)}.`,
-      thumbnail: coverUrl ? { url: coverUrl } : undefined,
-    }],
-    allowed_mentions: { users: listeners },
-  } });
+async function refreshLfgCardsForGames(env: Env, guildId: string, gameIds: string[], exceptMessageId?: string): Promise<void> {
+  const records = await refreshableLfgsForGames(env.DB, guildId, gameIds);
+  for (const record of records) {
+    if (!record.discordMessageId || record.discordMessageId === exceptMessageId) continue;
+    const snapshot = await lfgSnapshot(env.DB, guildId, record.id);
+    if (!snapshot) continue;
+    await editChannelMessage(env, record.channelId, record.discordMessageId, lfgMessageData(snapshot));
+  }
+}
+
+async function completeLfgAction(
+  env: Env,
+  i: DiscordInteraction,
+  lfgId: string,
+  action: "pause" | "resume" | "stop",
+): Promise<void> {
+  const actor = userId(i)!;
+  const messageId = i.message?.id;
+  try {
+    if (messageId) await saveLfgMessageId(env.DB, lfgId, messageId);
+    const result = await mutateLfg(env.DB, i.guild_id!, lfgId, actor, action);
+    const currentMessageId = messageId ?? result.snapshot.lfg.discordMessageId;
+    const finalData = lfgMessageData(result.snapshot);
+    let edited = currentMessageId
+      ? await editChannelMessage(env, result.snapshot.lfg.channelId, currentMessageId, finalData)
+      : false;
+    if (!edited) edited = await editInteractionOriginal(i, finalData);
+    if (!edited && currentMessageId) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      edited = await editChannelMessage(env, result.snapshot.lfg.channelId, currentMessageId, finalData);
+    }
+    await refreshLfgCardsForGames(env, result.snapshot.lfg.guildId, result.changedGameIds, currentMessageId);
+    if (action === "resume") {
+      await notifyLfgOverlap(
+        env,
+        result.snapshot.lfg.guildId,
+        result.snapshot.lfg.channelId,
+        actor,
+        result.snapshot.games,
+        result.newlyOverlappingGameIds,
+        result.recipients,
+      );
+    }
+    if (action === "stop") await collectDeletedCustomGames(env.DB);
+    if (!edited) await interactionFollowup(i, "The LFG state changed, but Discord could not refresh the card.");
+  } catch (error) {
+    const latest = await lfgSnapshot(env.DB, i.guild_id!, lfgId);
+    if (latest) {
+      const restored = messageId
+        ? await editChannelMessage(env, latest.lfg.channelId, messageId, lfgMessageData(latest))
+        : false;
+      if (!restored) await editInteractionOriginal(i, lfgMessageData(latest));
+    }
+    await interactionFollowup(i, error instanceof Error ? error.message : "Could not update this LFG.");
+  }
+}
+
+async function finalizeExpiredLfgs(env: Env): Promise<void> {
+  const expired = await expiredUnfinalizedLfgs(env.DB);
+  for (const item of expired) {
+    const snapshot = await lfgSnapshot(env.DB, item.lfg.guildId, item.lfg.id);
+    let ownCardUpdated = true;
+    if (snapshot && item.lfg.discordMessageId) {
+      ownCardUpdated = await editChannelMessage(env, item.lfg.channelId, item.lfg.discordMessageId, lfgMessageData(snapshot));
+    }
+    await refreshLfgCardsForGames(env, item.lfg.guildId, item.gameIds, item.lfg.discordMessageId);
+    if (ownCardUpdated || !item.lfg.discordMessageId) await markLfgFinalized(env.DB, item.lfg.id);
+  }
+}
+
+async function editChannelMessage(env: Env, channelId: string, messageId: string, body: Record<string, unknown>): Promise<boolean> {
+  if (!env.DISCORD_BOT_TOKEN) return false;
+  const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages/${messageId}`, {
+    method: "PATCH",
+    headers: { authorization: `Bot ${env.DISCORD_BOT_TOKEN}`, "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) console.error("Discord message edit failed", response.status, await response.text());
+  return response.ok;
+}
+
+async function editInteractionOriginal(i: DiscordInteraction, body: Record<string, unknown>): Promise<boolean> {
+  if (!i.application_id) return false;
+  const response = await fetch(`https://discord.com/api/v10/webhooks/${i.application_id}/${i.token}/messages/@original`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) console.error("Discord interaction edit failed", response.status, await response.text());
+  return response.ok;
+}
+
+async function interactionFollowup(i: DiscordInteraction, content: string): Promise<void> {
+  if (!i.application_id) return;
+  const response = await fetch(`https://discord.com/api/v10/webhooks/${i.application_id}/${i.token}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ content, flags: 64 }),
+  });
+  if (!response.ok) console.error("Discord interaction followup failed", response.status, await response.text());
 }
 
 async function createEvent(i: DiscordInteraction, env: Env, games: Game[], actor: string, ctx: ExecutionContext): Promise<Response> {
@@ -200,6 +351,7 @@ async function createEvent(i: DiscordInteraction, env: Env, games: Game[], actor
   const startsAt = parseWhen(whenInput, userZone.timeZone);
   const trigger = parseTrigger(whenInput);
   if (!startsAt && !trigger) return message("Use a scheduled date/time, or a trigger such as \"3 yes RSVPs\".", true);
+  if (userZone.shouldPrompt) await markTimezonePrompted(env.DB, i.guild_id!, actor);
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
   await env.DB.batch([
@@ -209,16 +361,10 @@ async function createEvent(i: DiscordInteraction, env: Env, games: Game[], actor
     env.DB.prepare("INSERT INTO rsvps (event_id, user_id, status, updated_at) VALUES (?, ?, 'yes', ?)").bind(id, actor, now),
     ...(trigger ? [env.DB.prepare("INSERT INTO event_triggers (event_id, type, threshold) VALUES (?, ?, ?)").bind(id, trigger.type, trigger.threshold)] : []),
   ]);
-  if (trigger && await fireRsvpTrigger(env.DB, id)) ctx.waitUntil(notifyActivation(env, id));
-  const listeners = await matchingListeners(env.DB, i.guild_id!, games.map((game) => game.id), actor);
-  const mentions = listeners.map((uid) => `<@${uid}>`).join(" ");
+  if (trigger && await fireRsvpTrigger(env.DB, id)) ctx.waitUntil(onEventActivated(env, id));
   const data = await eventMessageData(env.DB, id, i.guild_id!);
-  ctx.waitUntil(sendCustomGameControls(i, games));
-  return json({ type: ResponseType.ChannelMessage, data: {
-    ...data,
-    content: mentions || undefined,
-    allowed_mentions: { users: listeners },
-  } });
+  ctx.waitUntil(sendPostCommandControls(i, games, userZone.shouldPrompt));
+  return json({ type: ResponseType.ChannelMessage, data });
 }
 
 async function eventMessageData(db: D1Database, eventId: string, guildId: string): Promise<Record<string, unknown>> {
@@ -282,6 +428,10 @@ function eventComponents(eventId: string, games: Game[]): unknown[] {
   return components;
 }
 
+function timezoneComponent(): unknown {
+  return { type: 1, components: [{ type: 3, custom_id: "timezone:select", placeholder: "Optional: set your timezone", min_values: 1, max_values: 1, options: timezoneOptions }] };
+}
+
 function customGameDeleteComponents(i: DiscordInteraction, games: Game[], maxRows = 5): unknown[] {
   const actor = userId(i);
   if (!actor) return [];
@@ -302,16 +452,94 @@ function customGameDeleteComponents(i: DiscordInteraction, games: Game[], maxRow
   return rows;
 }
 
-async function sendCustomGameControls(i: DiscordInteraction, games: Game[]): Promise<void> {
+async function sendPostCommandControls(i: DiscordInteraction, games: Game[], shouldPromptTimezone: boolean): Promise<void> {
   if (!i.application_id) return;
-  const components = customGameDeleteComponents(i, games);
+  const components = [
+    ...(shouldPromptTimezone ? [timezoneComponent()] : []),
+    ...customGameDeleteComponents(i, games, shouldPromptTimezone ? 4 : 5),
+  ];
   if (!components.length) return;
   const response = await fetch(`https://discord.com/api/v10/webhooks/${i.application_id}/${i.token}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ content: "Custom game controls", flags: 64, components }),
+    body: JSON.stringify({ content: shouldPromptTimezone ? "Optional settings" : "Custom games", flags: 64, components }),
   });
-  if (!response.ok) console.error("Discord custom game controls failed", response.status, await response.text());
+  if (!response.ok) console.error("Discord post-command controls failed", response.status, await response.text());
+}
+
+async function component(i: DiscordInteraction, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const parts = i.data?.custom_id?.split(":") ?? [];
+  const action = parts[0];
+
+  if (action === "lfg") {
+    const requested = parts[1] as "pause" | "resume" | "stop" | "busy" | undefined;
+    const lfgId = parts[2];
+    if (!lfgId || !requested || requested === "busy" || !i.guild_id || !userId(i)) return message("This LFG action is not available.", true);
+    const snapshot = await lfgSnapshot(env.DB, i.guild_id, lfgId);
+    if (!snapshot) return message("That LFG no longer exists.", true);
+    if (snapshot.lfg.authorId !== userId(i)) return message("Only the person who created this LFG can change it.", true);
+    const state = lfgState(snapshot.lfg);
+    if (state === "expired" || state === "stopped") return message("This LFG has already ended.", true);
+    if (requested === "pause" && state !== "active") return message("This LFG is not active.", true);
+    if (requested === "resume" && state !== "paused") return message("This LFG is not paused.", true);
+    ctx.waitUntil(completeLfgAction(env, i, lfgId, requested));
+    return json({ type: ResponseType.UpdateMessage, data: lfgMessageData(snapshot, requested) });
+  }
+
+  if (action === "custom-game-delete") {
+    const gameId = parts[1];
+    if (!gameId || !i.guild_id || !userId(i)) return message("Invalid custom game deletion.", true);
+    try {
+      const games = new GameSelectionService(env.DB, getIgdbProvider(env));
+      const result = await games.deleteCustomGame(i.guild_id, gameId, userId(i)!, canManageGuild(i));
+      return message(
+        result.collected
+          ? `Deleted custom game **${result.game.name}**.`
+          : `Removed **${result.game.name}** from future selections. Existing LFGs and events will keep working until they finish.`,
+        true,
+      );
+    } catch (error) {
+      return message(error instanceof Error ? error.message : "Could not delete that custom game.", true);
+    }
+  }
+
+  if (action === "timezone") {
+    const sub = parts[1];
+    if (sub === "select") {
+      if (!i.guild_id || !userId(i)) return message("Invalid timezone selection context.", true);
+      const value = i.data?.values?.[0];
+      if (value === "skip" || !value) return message("Timezone unchanged. Using America/New_York by default.", true);
+      const selected = canonicalTimeZone(value);
+      if (!selected) return message("Invalid timezone selection.", true);
+      await env.DB.prepare(
+        "INSERT INTO users (guild_id, user_id, timezone, timezone_prompted_at) VALUES (?, ?, ?, ?) ON CONFLICT(guild_id, user_id) DO UPDATE SET timezone = excluded.timezone, timezone_prompted_at = excluded.timezone_prompted_at",
+      ).bind(i.guild_id, userId(i), selected, new Date().toISOString()).run();
+      return message(`Timezone set to ${selected}.`, true);
+    }
+    return message("Invalid timezone action.", true);
+  }
+
+  const [, eventId, status] = parts;
+  if (!eventId) return message("Invalid event action.", true);
+  const event = await env.DB.prepare("SELECT id FROM events WHERE id = ? AND guild_id = ?").bind(eventId, i.guild_id).first();
+  if (!event) return message("This event is not available in this server.", true);
+  if ((action === "rsvp" || action === "vote") && !await eventAcceptsChanges(env.DB, eventId)) {
+    return message("This event is no longer accepting changes.", true);
+  }
+  if (action === "rsvp" && ["yes", "maybe", "no"].includes(status ?? "")) {
+    await env.DB.prepare("INSERT INTO rsvps (event_id, user_id, status, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(event_id, user_id) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at")
+      .bind(eventId, userId(i), status, new Date().toISOString()).run();
+    if (await fireRsvpTrigger(env.DB, eventId)) ctx.waitUntil(onEventActivated(env, eventId));
+    return json({ type: ResponseType.UpdateMessage, data: await eventMessageData(env.DB, eventId, i.guild_id!) });
+  }
+  if (action === "vote") {
+    const values = i.data?.values ?? [];
+    const valid = await env.DB.prepare(`SELECT game_id FROM event_games WHERE event_id = ? AND game_id IN (${values.map(() => "?").join(",") || "NULL"})`).bind(eventId, ...values).all<{ game_id: string }>();
+    if (valid.results.length !== values.length) return message("Invalid game selection.", true);
+    await env.DB.batch([env.DB.prepare("DELETE FROM event_game_votes WHERE event_id = ? AND user_id = ?").bind(eventId, userId(i)), ...values.map((gameId) => env.DB.prepare("INSERT INTO event_game_votes (event_id, user_id, game_id) VALUES (?, ?, ?)").bind(eventId, userId(i), gameId))]);
+    return message("Game vote recorded.", true);
+  }
+  return message("Invalid event action.", true);
 }
 
 async function eventAcceptsChanges(db: D1Database, eventId: string): Promise<boolean> {
@@ -325,103 +553,22 @@ async function eventAcceptsChanges(db: D1Database, eventId: string): Promise<boo
   return !event.fired_at;
 }
 
-async function component(i: DiscordInteraction, env: Env, ctx: ExecutionContext): Promise<Response> {
-  const parts = i.data?.custom_id?.split(":") ?? [];
-  const action = parts[0];
-  if (action === "custom-game-delete") {
-    const gameId = parts[1];
-    if (!gameId || !i.guild_id || !userId(i)) return message("Invalid custom game deletion.", true);
-    try {
-      const games = new GameSelectionService(env.DB, getIgdbProvider(env));
-      const result = await games.deleteCustomGame(i.guild_id, gameId, userId(i)!, canManageGuild(i));
-      return message(
-        result.collected
-          ? `Deleted custom game **${result.game.name}**.`
-          : `Removed **${result.game.name}** from future selections. Existing LFGs, events, and listens will keep working until they finish.`,
-        true,
-      );
-    } catch (error) {
-      return message(error instanceof Error ? error.message : "Could not delete that custom game.", true);
-    }
-  }
-  if (action === "timezone") {
-    const sub = parts[1];
-    if (sub === "select") {
-      if (!i.guild_id || !userId(i)) return message("Invalid timezone selection context.", true);
-      const value = i.data?.values?.[0];
-      if (value === "skip" || !value) return message("Timezone unchanged. Using America/New_York by default.", true);
-      if (value === "other") {
-        return json({ type: ResponseType.Modal, data: {
-          custom_id: "timezone:modal",
-          title: "Enter your timezone",
-          components: [{ type: 1, components: [{ type: 4, custom_id: "tz_value", label: "IANA timezone (e.g. Europe/London)", style: 1, placeholder: "America/New_York", required: true }] }],
-        } });
-      }
-      const selected = canonicalTimeZone(value);
-      if (!selected) return message("Invalid timezone selection.", true);
-      await env.DB.prepare(
-        "INSERT INTO users (guild_id, user_id, timezone, timezone_prompted_at) VALUES (?, ?, ?, ?) ON CONFLICT(guild_id, user_id) DO UPDATE SET timezone = excluded.timezone, timezone_prompted_at = excluded.timezone_prompted_at",
-      ).bind(i.guild_id, userId(i), selected, new Date().toISOString()).run();
-      return message(`Timezone set to ${selected}.`, true);
-    }
-    if (sub === "other") {
-      return json({ type: ResponseType.Modal, data: {
-        custom_id: "timezone:modal",
-        title: "Enter your timezone",
-        components: [{ type: 1, components: [{ type: 4, custom_id: "tz_value", label: "IANA timezone (e.g. Europe/London)", style: 1, placeholder: "America/New_York", required: true }] }],
-      } });
-    }
-    if (sub === "modal") {
-      if (!i.guild_id || !userId(i)) return message("Invalid timezone context.", true);
-      const raw = (i.data as { components?: Array<{ components?: Array<{ value?: string }> }> })?.components?.[0]?.components?.[0]?.value;
-      const selected = canonicalTimeZone(raw);
-      if (!selected) return message(`"${raw ?? ""}" is not a valid IANA timezone.`, true);
-      await env.DB.prepare(
-        "INSERT INTO users (guild_id, user_id, timezone, timezone_prompted_at) VALUES (?, ?, ?, ?) ON CONFLICT(guild_id, user_id) DO UPDATE SET timezone = excluded.timezone, timezone_prompted_at = excluded.timezone_prompted_at",
-      ).bind(i.guild_id, userId(i), selected, new Date().toISOString()).run();
-      return message(`Timezone set to ${selected}.`, true);
-    }
-    return message("Invalid timezone action.", true);
-  }
-  const [, eventId, status] = parts;
-  if (!eventId) return message("Invalid event action.", true);
-  const event = await env.DB.prepare("SELECT id FROM events WHERE id = ? AND guild_id = ?").bind(eventId, i.guild_id).first();
-  if (!event) return message("This event is not available in this server.", true);
-  if ((action === "rsvp" || action === "vote") && !await eventAcceptsChanges(env.DB, eventId)) {
-    return message("This event is no longer accepting changes.", true);
-  }
-  if (action === "rsvp" && ["yes", "maybe", "no"].includes(status ?? "")) {
-    await env.DB.prepare("INSERT INTO rsvps (event_id, user_id, status, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(event_id, user_id) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at")
-      .bind(eventId, userId(i), status, new Date().toISOString()).run();
-    if (await fireRsvpTrigger(env.DB, eventId)) ctx.waitUntil(notifyActivation(env, eventId));
-    return json({ type: ResponseType.UpdateMessage, data: await eventMessageData(env.DB, eventId, i.guild_id!) });
-  }
-  if (action === "vote") {
-    const values = i.data?.values ?? [];
-    const valid = await env.DB.prepare(`SELECT game_id FROM event_games WHERE event_id = ? AND game_id IN (${values.map(() => "?").join(",") || "NULL"})`).bind(eventId, ...values).all<{ game_id: string }>();
-    if (valid.results.length !== values.length) return message("Invalid game selection.", true);
-    await env.DB.batch([env.DB.prepare("DELETE FROM event_game_votes WHERE event_id = ? AND user_id = ?").bind(eventId, userId(i)), ...values.map((gameId) => env.DB.prepare("INSERT INTO event_game_votes (event_id, user_id, game_id) VALUES (?, ?, ?)").bind(eventId, userId(i), gameId))]);
-    return message("Game vote recorded.", true);
-  }
-  return message("Invalid event action.", true);
-}
-
 async function userTimeZone(db: D1Database, guildId: string, userIdValue: string): Promise<{ timeZone: string; shouldPrompt: boolean }> {
   const user = await db.prepare("SELECT timezone, timezone_prompted_at FROM users WHERE guild_id = ? AND user_id = ?")
     .bind(guildId, userIdValue).first<{ timezone?: string; timezone_prompted_at?: string }>();
   const shouldPrompt = !user?.timezone && !user?.timezone_prompted_at;
-  if (!user) {
-    await db.prepare("INSERT OR IGNORE INTO users (guild_id, user_id) VALUES (?, ?)").bind(guildId, userIdValue).run();
-  }
+  if (!user) await db.prepare("INSERT OR IGNORE INTO users (guild_id, user_id) VALUES (?, ?)").bind(guildId, userIdValue).run();
   return { timeZone: effectiveTimeZone(user?.timezone), shouldPrompt };
 }
 
-function timezoneComponent(): unknown {
-  return { type: 1, components: [{ type: 3, custom_id: "timezone:select", placeholder: "Optional: set your timezone", min_values: 0, max_values: 1, options: timezoneOptions }] };
+async function markTimezonePrompted(db: D1Database, guildId: string, userIdValue: string): Promise<void> {
+  await db.prepare(
+    "INSERT INTO users (guild_id, user_id, timezone_prompted_at) VALUES (?, ?, ?) ON CONFLICT(guild_id, user_id) DO UPDATE SET timezone_prompted_at = excluded.timezone_prompted_at",
+  ).bind(guildId, userIdValue, new Date().toISOString()).run();
 }
 
 function parseTrigger(value: string): { type: string; threshold: number } | undefined {
-  const match = /^(\d+)\s+(people online|listeners online|yes rsvps|yes-or-maybe rsvps)$/i.exec(value.trim());
+  const match = /^(\d+)\s+(people online|yes rsvps|yes-or-maybe rsvps)$/i.exec(value.trim());
   return match ? { threshold: Number(match[1]), type: match[2].toLowerCase().replaceAll(" ", "_") } : undefined;
 }
 
@@ -443,6 +590,11 @@ async function sendScheduledNotifications(env: Env, now = new Date()): Promise<v
   }
 }
 
+async function onEventActivated(env: Env, eventId: string): Promise<void> {
+  await notifyActivation(env, eventId);
+  await collectDeletedCustomGames(env.DB);
+}
+
 async function notifyActivation(env: Env, eventId: string): Promise<void> {
   const event = await env.DB.prepare("SELECT channel_id, title FROM events WHERE id = ?").bind(eventId)
     .first<{ channel_id: string; title: string }>();
@@ -454,7 +606,10 @@ async function deliver(env: Env, eventId: string, userIdValue: string, kind: "re
   const claimed = await env.DB.prepare("INSERT OR IGNORE INTO event_deliveries (event_id, user_id, kind, delivered_at) VALUES (?, ?, ?, ?)")
     .bind(eventId, userIdValue, kind, new Date().toISOString()).run();
   if (!claimed.meta.changes) return;
-  const response = await postChannelMessage(env, channelId, { content });
+  const response = await postChannelMessage(env, channelId, {
+    content,
+    allowed_mentions: userIdValue ? { users: [userIdValue] } : { parse: [] },
+  });
   if (!response?.ok) await env.DB.prepare("DELETE FROM event_deliveries WHERE event_id = ? AND user_id = ? AND kind = ?")
     .bind(eventId, userIdValue, kind).run();
 }

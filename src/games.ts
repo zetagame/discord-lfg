@@ -104,24 +104,17 @@ export class GameSelectionService {
     if (found) return found;
 
     const external = (await this.provider.search(name)).find((game) => game.name.toLowerCase() === name.toLowerCase());
+    const storedName = external?.name ?? name;
     const deleted = await this.db.prepare(`
       SELECT id FROM games WHERE guild_id = ? AND name = ? AND deleted_at IS NOT NULL
-    `).bind(guildId, external?.name ?? name).first<{ id: string }>();
-    if (deleted) {
-      await this.db.prepare(`
-        UPDATE games
-        SET provider_id = ?, cover_url = ?, created_by_user_id = ?, deleted_at = NULL
-        WHERE id = ?
-      `).bind(external?.providerId ?? null, external?.coverUrl ?? null, external ? null : createdByUserId ?? null, deleted.id).run();
-      return (await this.db.prepare(`
-        SELECT id, name, provider_id AS providerId, cover_url AS coverUrl, created_by_user_id AS createdByUserId
-        FROM games WHERE id = ?
-      `).bind(deleted.id).first<Game>())!;
+    `).bind(guildId, storedName).first<{ id: string }>();
+    if (deleted && !await collectDeletedCustomGame(this.db, deleted.id)) {
+      throw new Error(`**${storedName}** was removed but is still attached to an active LFG or event. Try again after it finishes.`);
     }
 
     const game = {
       id: crypto.randomUUID(),
-      name: external?.name ?? name,
+      name: storedName,
       providerId: external?.providerId,
       coverUrl: external?.coverUrl,
       createdByUserId: external ? undefined : createdByUserId,
@@ -140,35 +133,12 @@ export class GameSelectionService {
   }
 }
 
-type NotificationRow = {
-  id: string;
-  user_id: string;
-  action: "listen" | "unlisten";
-  created_at: string;
-  expires_at?: string;
-};
-
-async function notificationHistoryStillNeeded(db: D1Database, gameId: string): Promise<boolean> {
-  const rows = await db.prepare(`
-    SELECT id, user_id, action, created_at, expires_at
-    FROM notification_actions
-    WHERE game_id = ? AND (expires_at IS NULL OR julianday(expires_at) > julianday('now'))
-    ORDER BY user_id, created_at DESC, id DESC
-  `).bind(gameId).all<NotificationRow>();
-  const latest = new Map<string, NotificationRow>();
-  for (const row of rows.results) if (!latest.has(row.user_id)) latest.set(row.user_id, row);
-  for (const row of latest.values()) {
-    if (row.action === "listen") return true;
-    if (row.expires_at) return true;
-  }
-  return false;
-}
-
-async function hasActiveLfg(db: D1Database, gameId: string): Promise<boolean> {
+async function hasOpenLfg(db: D1Database, gameId: string): Promise<boolean> {
   const row = await db.prepare(`
     SELECT 1 AS found
     FROM lfg_games JOIN lfgs ON lfgs.id = lfg_games.lfg_id
-    WHERE lfg_games.game_id = ? AND julianday(lfgs.expires_at) > julianday('now')
+    WHERE lfg_games.game_id = ? AND lfgs.stopped_at IS NULL
+      AND julianday(lfgs.expires_at) > julianday('now')
     LIMIT 1
   `).bind(gameId).first<{ found: number }>();
   return Boolean(row);
@@ -193,15 +163,12 @@ export async function collectDeletedCustomGame(db: D1Database, gameId: string): 
   const deleted = await db.prepare("SELECT id FROM games WHERE id = ? AND provider_id IS NULL AND deleted_at IS NOT NULL")
     .bind(gameId).first<{ id: string }>();
   if (!deleted) return false;
-
-  if (await notificationHistoryStillNeeded(db, gameId)) return false;
-  if (await hasActiveLfg(db, gameId)) return false;
+  if (await hasOpenLfg(db, gameId)) return false;
   if (await hasActiveEvent(db, gameId)) return false;
 
   await db.batch([
-    db.prepare("DELETE FROM notification_actions WHERE game_id = ?").bind(gameId),
     db.prepare(`DELETE FROM lfg_games WHERE game_id = ? AND lfg_id IN (
-      SELECT id FROM lfgs WHERE julianday(expires_at) <= julianday('now')
+      SELECT id FROM lfgs WHERE stopped_at IS NOT NULL OR julianday(expires_at) <= julianday('now')
     )`).bind(gameId),
     db.prepare(`DELETE FROM event_game_votes WHERE game_id = ? AND event_id IN (
       SELECT events.id FROM events LEFT JOIN event_triggers ON event_triggers.event_id = events.id
@@ -217,11 +184,10 @@ export async function collectDeletedCustomGame(db: D1Database, gameId: string): 
 
   const references = await db.prepare(`
     SELECT
-      (SELECT COUNT(*) FROM notification_actions WHERE game_id = ?) +
       (SELECT COUNT(*) FROM lfg_games WHERE game_id = ?) +
       (SELECT COUNT(*) FROM event_games WHERE game_id = ?) +
       (SELECT COUNT(*) FROM event_game_votes WHERE game_id = ?) AS count
-  `).bind(gameId, gameId, gameId, gameId).first<{ count: number }>();
+  `).bind(gameId, gameId, gameId).first<{ count: number }>();
   if ((references?.count ?? 0) > 0) return false;
 
   await db.batch([
