@@ -1,5 +1,4 @@
 import { collectDeletedCustomGames, IgdbProvider, GameSelectionService } from "./games";
-import { currentListenedGames, matchingLfgCreators, matchingListeners, recordNotificationAction } from "./notifications";
 import { InteractionType, ResponseType, json, option, userId, verifyDiscordRequest } from "./discord";
 import { canonicalTimeZone, discordTimestamp, effectiveTimeZone, parseWhen } from "./time";
 import { dueDeliveries, fireRsvpTrigger } from "./events";
@@ -8,9 +7,6 @@ import type { DiscordInteraction, Env, Game } from "./types";
 const gameOption = { name: "games", description: "Games", type: 3, required: true, autocomplete: true };
 const durationOption = { name: "duration", description: "Duration", type: 3 };
 const commands = [
-  { name: "listen", description: "Listen for game alerts", options: [gameOption, durationOption] },
-  { name: "unlisten", description: "Stop game alerts", options: [gameOption, durationOption] },
-  { name: "mute", description: "Stop game alerts", options: [gameOption, durationOption] },
   { name: "lfg", description: "Post a looking-for-group alert", options: [gameOption, durationOption] },
   { name: "create", description: "Create a game event", options: [gameOption, { name: "when", description: "When", type: 3, required: true }] },
 ];
@@ -33,14 +29,16 @@ const timezoneOptions = [
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    if (request.method === "GET" && new URL(request.url).pathname === "/commands") return json(commands);
+    const url = new URL(request.url);
+    if (request.method === "GET" && url.pathname === "/commands") return json(commands);
+    if (request.method === "GET" && url.pathname === "/register-commands") return registerCommands(env);
     if (request.method !== "POST") return new Response("Not found", { status: 404 });
     const interaction = await verifyDiscordRequest(request, env.DISCORD_PUBLIC_KEY);
     if (!interaction) return new Response("Invalid request signature", { status: 401 });
     if (interaction.type === InteractionType.Ping) return json({ type: ResponseType.Pong });
     if (!interaction.guild_id || !interaction.channel_id || !userId(interaction)) return message("Use this command in a server channel.", true);
     const games = new GameSelectionService(env.DB, getIgdbProvider(env));
-    if (interaction.type === InteractionType.Autocomplete) return autocomplete(interaction, env, games);
+    if (interaction.type === InteractionType.Autocomplete) return autocomplete(interaction, games);
     if (interaction.type === InteractionType.Component) return component(interaction, env, ctx);
     if (interaction.type === InteractionType.ApplicationCommand) return command(interaction, env, games, ctx);
     if (interaction.type === InteractionType.ModalSubmit) return component(interaction, env, ctx);
@@ -52,24 +50,35 @@ export default {
   },
 } satisfies ExportedHandler<Env>;
 
-async function autocomplete(interaction: DiscordInteraction, env: Env, games: GameSelectionService): Promise<Response> {
+async function registerCommands(env: Env): Promise<Response> {
+  if (!env.DISCORD_BOT_TOKEN) return new Response("DISCORD_BOT_TOKEN is not configured.", { status: 500 });
+  const headers = { authorization: `Bot ${env.DISCORD_BOT_TOKEN}`, "content-type": "application/json" };
+  const appResponse = await fetch("https://discord.com/api/v10/applications/@me", { headers });
+  if (!appResponse.ok) return new Response(`Could not identify Discord application (${appResponse.status}).`, { status: 502 });
+  const application = await appResponse.json() as { id: string };
+  const response = await fetch(`https://discord.com/api/v10/applications/${application.id}/commands`, {
+    method: "PUT",
+    headers,
+    body: JSON.stringify(commands),
+  });
+  if (!response.ok) return new Response(`Discord registration failed (${response.status}).`, { status: 502 });
+  return new Response("Registered /lfg and /create. This temporary endpoint can now be removed.");
+}
+
+async function autocomplete(interaction: DiscordInteraction, games: GameSelectionService): Promise<Response> {
   const focused = interaction.data?.options?.find((item) => item.focused);
   const parts = String(focused?.value ?? "").split(",");
   const query = parts.at(-1)?.trim() ?? "";
   const selectedNames = parts.slice(0, -1).map((part) => part.trim()).filter(Boolean);
   const prefix = selectedNames.join(", ");
-  const actor = userId(interaction)!;
-  const managesListens = interaction.data?.name === "unlisten" || interaction.data?.name === "mute";
-  const choices = managesListens
-    ? await currentListenedGames(env.DB, interaction.guild_id!, actor, query)
-    : await games.search(interaction.guild_id!, query);
+  const choices = await games.search(interaction.guild_id!, query);
   const filtered = choices.filter((game) => !selectedNames.some((name) => name.toLowerCase() === game.name.toLowerCase()));
-  if (!managesListens && query && !filtered.some((game) => game.name.toLowerCase() === query.toLowerCase())) {
+  if (query && !filtered.some((game) => game.name.toLowerCase() === query.toLowerCase())) {
     filtered.push({ id: "custom", name: `Use "${query}"` });
   }
   return json({ type: ResponseType.Autocomplete, data: { choices: filtered.slice(0, 25).map((game) => {
     const customFallback = game.id === "custom";
-    const suffix = game.deletedAt ? " · removed" : !customFallback && !game.providerId ? " · custom" : "";
+    const suffix = !customFallback && !game.providerId ? " · custom" : "";
     return {
       name: `${game.name}${suffix}`.slice(0, 100),
       value: prefix
@@ -83,12 +92,7 @@ async function command(i: DiscordInteraction, env: Env, games: GameSelectionServ
   const name = i.data?.name;
   const actor = userId(i)!;
   try {
-    const input = String(option(i, "games") ?? "");
-    const selected = name === "unlisten" || name === "mute"
-      ? await resolveCurrentListens(env.DB, i.guild_id!, actor, input)
-      : await games.resolve(i.guild_id!, input, actor);
-    if (name === "listen") return listen(i, env, selected, "listen", actor, ctx);
-    if (name === "unlisten" || name === "mute") return listen(i, env, selected, "unlisten", actor, ctx);
+    const selected = await games.resolve(i.guild_id!, String(option(i, "games") ?? ""), actor);
     if (name === "lfg") return lfg(i, env, selected, actor, ctx);
     if (name === "create") return createEvent(i, env, selected, actor, ctx);
   } catch (error) {
@@ -106,68 +110,6 @@ function canManageGuild(i: DiscordInteraction): boolean {
   }
 }
 
-async function resolveCurrentListens(db: D1Database, guildId: string, actor: string, input: string): Promise<Game[]> {
-  const requested = [...new Set(input.split(",").map((name) => name.trim()).filter(Boolean))];
-  if (!requested.length) throw new Error("Choose one of your current listens.");
-  const current = await currentListenedGames(db, guildId, actor);
-  return requested.map((name) => {
-    const game = current.find((candidate) => candidate.name.toLowerCase() === name.toLowerCase());
-    if (!game) throw new Error(`You are not currently listening for ${name}.`);
-    return game;
-  });
-}
-
-async function listen(
-  i: DiscordInteraction,
-  env: Env,
-  games: Game[],
-  action: "listen" | "unlisten",
-  actor: string,
-  ctx: ExecutionContext,
-): Promise<Response> {
-  const userZone = await userTimeZone(env.DB, i.guild_id!, actor);
-  const timeZone = userZone.timeZone;
-  const duration = parseWhen(String(option(i, "duration") ?? ""), timeZone);
-  if (option(i, "duration") && !duration) return message("Use a duration such as 30m, 2h, 3d, tonight, or this weekend.", true);
-  const previouslyListening = action === "listen" ? await currentListenedGames(env.DB, i.guild_id!, actor) : [];
-  await recordNotificationAction(env.DB, i.guild_id!, actor, games.map((game) => game.id), action, duration);
-  if (action === "listen") {
-    const newGames = games.filter((game) => !previouslyListening.some((current) => current.id === game.id));
-    if (newGames.length) ctx.waitUntil(notifyNewListenMatches(env, i.guild_id!, i.channel_id!, actor, newGames));
-  } else {
-    ctx.waitUntil(collectDeletedCustomGames(env.DB));
-  }
-  const word = action === "listen" ? "Listening for" : "Not listening for";
-  const content = `${word} ${gameNames(games)}${duration ? ` until ${discordTimestamp(duration)}` : ""}.`;
-  const deleteRows = customGameDeleteComponents(i, games, userZone.shouldPrompt ? 4 : 5);
-  const components = userZone.shouldPrompt ? [timezoneComponent(), ...deleteRows] : deleteRows;
-  if (userZone.shouldPrompt) {
-    await env.DB.prepare(
-      "INSERT INTO users (guild_id, user_id, timezone_prompted_at) VALUES (?, ?, ?) ON CONFLICT(guild_id, user_id) DO UPDATE SET timezone_prompted_at = excluded.timezone_prompted_at",
-    ).bind(i.guild_id, actor, new Date().toISOString()).run();
-  }
-  return json({ type: ResponseType.ChannelMessage, data: {
-    content,
-    flags: 64,
-    components: components.length ? components : undefined,
-  } });
-}
-
-async function notifyNewListenMatches(env: Env, guildId: string, channelId: string, actor: string, games: Game[]): Promise<void> {
-  const gameIds = games.map((game) => game.id);
-  const [listeners, lfgCreators] = await Promise.all([
-    matchingListeners(env.DB, guildId, gameIds, actor),
-    matchingLfgCreators(env.DB, guildId, gameIds, actor),
-  ]);
-  const recipients = [...new Set([...listeners, ...lfgCreators])];
-  if (!recipients.length) return;
-  const mentions = recipients.map((uid) => `<@${uid}>`).join(" ");
-  await postChannelMessage(env, channelId, {
-    content: `${mentions} New match: <@${actor}> is now listening for ${gameNames(games)}.`,
-    allowed_mentions: { users: recipients },
-  });
-}
-
 async function lfg(i: DiscordInteraction, env: Env, games: Game[], actor: string, ctx: ExecutionContext): Promise<Response> {
   const userZone = await userTimeZone(env.DB, i.guild_id!, actor);
   const timeZone = userZone.timeZone;
@@ -179,18 +121,14 @@ async function lfg(i: DiscordInteraction, env: Env, games: Game[], actor: string
       .bind(id, i.guild_id, i.channel_id, actor, duration.toISOString(), new Date().toISOString()),
     ...games.map((game) => env.DB.prepare("INSERT INTO lfg_games (lfg_id, game_id) VALUES (?, ?)").bind(id, game.id)),
   ]);
-  const listeners = await matchingListeners(env.DB, i.guild_id!, games.map((game) => game.id), actor);
-  const mentions = listeners.map((uid) => `<@${uid}>`).join(" ");
   const coverUrl = games.find((game) => game.coverUrl)?.coverUrl;
   ctx.waitUntil(sendCustomGameControls(i, games));
   return json({ type: ResponseType.ChannelMessage, data: {
-    content: mentions || undefined,
     embeds: [{
       title: `LFG: ${gameNames(games)}`,
       description: `Available until ${discordTimestamp(duration)}.`,
       thumbnail: coverUrl ? { url: coverUrl } : undefined,
     }],
-    allowed_mentions: { users: listeners },
   } });
 }
 
@@ -210,15 +148,9 @@ async function createEvent(i: DiscordInteraction, env: Env, games: Game[], actor
     ...(trigger ? [env.DB.prepare("INSERT INTO event_triggers (event_id, type, threshold) VALUES (?, ?, ?)").bind(id, trigger.type, trigger.threshold)] : []),
   ]);
   if (trigger && await fireRsvpTrigger(env.DB, id)) ctx.waitUntil(notifyActivation(env, id));
-  const listeners = await matchingListeners(env.DB, i.guild_id!, games.map((game) => game.id), actor);
-  const mentions = listeners.map((uid) => `<@${uid}>`).join(" ");
   const data = await eventMessageData(env.DB, id, i.guild_id!);
   ctx.waitUntil(sendCustomGameControls(i, games));
-  return json({ type: ResponseType.ChannelMessage, data: {
-    ...data,
-    content: mentions || undefined,
-    allowed_mentions: { users: listeners },
-  } });
+  return json({ type: ResponseType.ChannelMessage, data });
 }
 
 async function eventMessageData(db: D1Database, eventId: string, guildId: string): Promise<Record<string, unknown>> {
@@ -337,7 +269,7 @@ async function component(i: DiscordInteraction, env: Env, ctx: ExecutionContext)
       return message(
         result.collected
           ? `Deleted custom game **${result.game.name}**.`
-          : `Removed **${result.game.name}** from future selections. Existing LFGs, events, and listens will keep working until they finish.`,
+          : `Removed **${result.game.name}** from future selections. Existing LFGs and events will keep working until they finish.`,
         true,
       );
     } catch (error) {
