@@ -24,6 +24,8 @@ import { ResponseType, json, userId } from "./discord";
 import { discordTimestamp } from "./time";
 import type { DiscordInteraction, Env, Game } from "./types";
 
+type PanelEditResult = "updated" | "missing" | "retry";
+
 export async function handleLfgCommand(
   i: DiscordInteraction,
   env: Env,
@@ -183,24 +185,33 @@ export async function syncGamePanel(env: Env, guildId: string, gameId: string, p
   if (!panelChannel) return;
 
   if (snapshot.group.discordMessageId && snapshot.group.channelId) {
-    if (await editChannelMessage(env, snapshot.group.channelId, snapshot.group.discordMessageId, gamePanelData(snapshot))) return;
+    const edit = await editChannelMessage(env, snapshot.group.channelId, snapshot.group.discordMessageId, gamePanelData(snapshot));
+    if (edit === "updated") return;
+    if (edit === "retry") return;
     await clearPanelMessage(env.DB, snapshot.group.id, snapshot.group.discordMessageId);
     snapshot = (await loadGameGroupSnapshot(env.DB, guildId, gameId)) ?? snapshot;
   }
 
   const claim = crypto.randomUUID();
   if (!await claimPanelCreation(env.DB, snapshot.group.id, panelChannel, claim)) return;
-  const response = await postChannelMessage(env, panelChannel, gamePanelData(snapshot));
-  if (!response?.ok) {
+  let createdMessageId: string | undefined;
+  try {
+    const response = await postChannelMessage(env, panelChannel, gamePanelData(snapshot));
+    if (!response?.ok) return;
+    const body = await response.json() as { id?: string };
+    if (!body.id) return;
+    createdMessageId = body.id;
+    const saved = await savePanelMessage(env.DB, snapshot.group.id, claim, panelChannel, body.id);
+    if (!saved) {
+      await deleteChannelMessage(env, panelChannel, body.id);
+      createdMessageId = undefined;
+    }
+  } catch (error) {
+    console.error("Shared panel creation failed", error);
+    if (createdMessageId) await deleteChannelMessage(env, panelChannel, createdMessageId);
+  } finally {
     await releasePanelClaim(env.DB, snapshot.group.id, claim);
-    return;
   }
-  const body = await response.json() as { id?: string };
-  if (!body.id) {
-    await releasePanelClaim(env.DB, snapshot.group.id, claim);
-    return;
-  }
-  await savePanelMessage(env.DB, snapshot.group.id, claim, panelChannel, body.id);
 }
 
 export async function syncSharedGameGroups(env: Env): Promise<void> {
@@ -244,45 +255,76 @@ async function notifyGroupOverlaps(env: Env, channelId: string, actor: string, u
 
 async function postChannelMessage(env: Env, channelId: string, body: Record<string, unknown>): Promise<Response | undefined> {
   if (!env.DISCORD_BOT_TOKEN) return undefined;
-  const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
-    method: "POST",
-    headers: { authorization: `Bot ${env.DISCORD_BOT_TOKEN}`, "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!response.ok) console.error("Discord channel message failed", response.status, await response.text());
-  return response;
+  try {
+    const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
+      method: "POST",
+      headers: { authorization: `Bot ${env.DISCORD_BOT_TOKEN}`, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) console.error("Discord channel message failed", response.status, await response.text());
+    return response;
+  } catch (error) {
+    console.error("Discord channel message request failed", error);
+    return undefined;
+  }
 }
 
-async function editChannelMessage(env: Env, channelId: string, messageId: string, body: Record<string, unknown>): Promise<boolean> {
-  if (!env.DISCORD_BOT_TOKEN) return false;
-  const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages/${messageId}`, {
-    method: "PATCH",
-    headers: { authorization: `Bot ${env.DISCORD_BOT_TOKEN}`, "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!response.ok) console.error("Discord group panel edit failed", response.status, await response.text());
-  return response.ok;
+async function editChannelMessage(
+  env: Env,
+  channelId: string,
+  messageId: string,
+  body: Record<string, unknown>,
+): Promise<PanelEditResult> {
+  if (!env.DISCORD_BOT_TOKEN) return "retry";
+  try {
+    const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages/${messageId}`, {
+      method: "PATCH",
+      headers: { authorization: `Bot ${env.DISCORD_BOT_TOKEN}`, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (response.ok) return "updated";
+    const detail = await response.text();
+    if (response.status === 404) {
+      console.warn("Discord group panel is missing", messageId, detail);
+      return "missing";
+    }
+    console.error("Discord group panel edit failed", response.status, detail);
+    return "retry";
+  } catch (error) {
+    console.error("Discord group panel edit request failed", error);
+    return "retry";
+  }
 }
 
 async function deleteChannelMessage(env: Env, channelId: string, messageId: string): Promise<boolean> {
   if (!env.DISCORD_BOT_TOKEN) return false;
-  const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages/${messageId}`, {
-    method: "DELETE",
-    headers: { authorization: `Bot ${env.DISCORD_BOT_TOKEN}` },
-  });
-  if (!response.ok && response.status !== 404) console.error("Discord group panel delete failed", response.status, await response.text());
-  return response.ok || response.status === 404;
+  try {
+    const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages/${messageId}`, {
+      method: "DELETE",
+      headers: { authorization: `Bot ${env.DISCORD_BOT_TOKEN}` },
+    });
+    if (!response.ok && response.status !== 404) console.error("Discord group panel delete failed", response.status, await response.text());
+    return response.ok || response.status === 404;
+  } catch (error) {
+    console.error("Discord group panel delete request failed", error);
+    return false;
+  }
 }
 
 async function editInteractionOriginal(i: DiscordInteraction, body: Record<string, unknown>): Promise<boolean> {
   if (!i.application_id) return false;
-  const response = await fetch(`https://discord.com/api/v10/webhooks/${i.application_id}/${i.token}/messages/@original`, {
-    method: "PATCH",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!response.ok) console.error("Discord interaction edit failed", response.status, await response.text());
-  return response.ok;
+  try {
+    const response = await fetch(`https://discord.com/api/v10/webhooks/${i.application_id}/${i.token}/messages/@original`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) console.error("Discord interaction edit failed", response.status, await response.text());
+    return response.ok;
+  } catch (error) {
+    console.error("Discord interaction edit request failed", error);
+    return false;
+  }
 }
 
 async function interactionFollowup(i: DiscordInteraction, content: string): Promise<void> {
@@ -291,12 +333,16 @@ async function interactionFollowup(i: DiscordInteraction, content: string): Prom
 
 async function interactionFollowupData(i: DiscordInteraction, data: Record<string, unknown>): Promise<void> {
   if (!i.application_id) return;
-  const response = await fetch(`https://discord.com/api/v10/webhooks/${i.application_id}/${i.token}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ ...data, flags: 64 }),
-  });
-  if (!response.ok) console.error("Discord interaction followup failed", response.status, await response.text());
+  try {
+    const response = await fetch(`https://discord.com/api/v10/webhooks/${i.application_id}/${i.token}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...data, flags: 64 }),
+    });
+    if (!response.ok) console.error("Discord interaction followup failed", response.status, await response.text());
+  } catch (error) {
+    console.error("Discord interaction followup request failed", error);
+  }
 }
 
 function ephemeral(content: string): Response {
