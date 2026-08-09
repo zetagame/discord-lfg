@@ -100,11 +100,15 @@ export async function createLfg(
       .bind(id, guildId, channelId, authorId, expiresAt.toISOString(), createdAt),
     ...gameIds.map((gameId) => db.prepare("INSERT INTO lfg_games (lfg_id, game_id) VALUES (?, ?)").bind(id, gameId)),
   ]);
+  const after = await activeUsersByGame(db, guildId, gameIds);
   const newlyOverlappingGameIds = gameIds.filter((gameId) => {
-    const users = before.get(gameId) ?? [];
-    return !users.includes(authorId) && users.some((userId) => userId !== authorId);
+    const beforeUsers = before.get(gameId) ?? [];
+    const afterUsers = after.get(gameId) ?? [];
+    return !beforeUsers.includes(authorId)
+      && afterUsers.includes(authorId)
+      && afterUsers.some((userId) => userId !== authorId);
   });
-  const recipients = [...new Set(newlyOverlappingGameIds.flatMap((gameId) => before.get(gameId) ?? []).filter((userId) => userId !== authorId))];
+  const recipients = [...new Set(newlyOverlappingGameIds.flatMap((gameId) => (after.get(gameId) ?? []).filter((userId) => userId !== authorId)))];
   return { id, newlyOverlappingGameIds, recipients };
 }
 
@@ -126,23 +130,22 @@ export async function mutateLfg(
   const gameIds = games.map((game) => game.id);
   const before = await activeUsersByGame(db, guildId, gameIds);
   const now = new Date().toISOString();
-  let update;
   if (action === "pause") {
-    update = await db.prepare(`
+    const update = await db.prepare(`
       UPDATE lfgs SET paused_at = ?
       WHERE id = ? AND guild_id = ? AND author_id = ? AND paused_at IS NULL AND stopped_at IS NULL
         AND julianday(expires_at) > julianday('now')
     `).bind(now, lfgId, guildId, actorId).run();
     if (!update.meta.changes) throw new Error("This LFG is no longer active.");
   } else if (action === "resume") {
-    update = await db.prepare(`
+    const update = await db.prepare(`
       UPDATE lfgs SET paused_at = NULL
       WHERE id = ? AND guild_id = ? AND author_id = ? AND paused_at IS NOT NULL AND stopped_at IS NULL
         AND julianday(expires_at) > julianday('now')
     `).bind(lfgId, guildId, actorId).run();
     if (!update.meta.changes) throw new Error("This LFG is no longer paused.");
   } else {
-    update = await db.prepare(`
+    const update = await db.prepare(`
       UPDATE lfgs SET stopped_at = ?, paused_at = NULL, finalized_at = ?
       WHERE id = ? AND guild_id = ? AND author_id = ? AND stopped_at IS NULL
         AND julianday(expires_at) > julianday('now')
