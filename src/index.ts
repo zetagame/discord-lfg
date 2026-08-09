@@ -265,13 +265,14 @@ async function completeLfgAction(
     if (messageId) await saveLfgMessageId(env.DB, lfgId, messageId);
     const result = await mutateLfg(env.DB, i.guild_id!, lfgId, actor, action);
     const currentMessageId = messageId ?? result.snapshot.lfg.discordMessageId;
-    let edited = true;
-    if (currentMessageId) {
-      edited = await editChannelMessage(env, result.snapshot.lfg.channelId, currentMessageId, lfgMessageData(result.snapshot));
-      if (!edited) {
-        await new Promise((resolve) => setTimeout(resolve, 250));
-        edited = await editChannelMessage(env, result.snapshot.lfg.channelId, currentMessageId, lfgMessageData(result.snapshot));
-      }
+    const finalData = lfgMessageData(result.snapshot);
+    let edited = currentMessageId
+      ? await editChannelMessage(env, result.snapshot.lfg.channelId, currentMessageId, finalData)
+      : false;
+    if (!edited) edited = await editInteractionOriginal(i, finalData);
+    if (!edited && currentMessageId) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      edited = await editChannelMessage(env, result.snapshot.lfg.channelId, currentMessageId, finalData);
     }
     await refreshLfgCardsForGames(env, result.snapshot.lfg.guildId, result.changedGameIds, currentMessageId);
     if (action === "resume") {
@@ -286,10 +287,15 @@ async function completeLfgAction(
       );
     }
     if (action === "stop") await collectDeletedCustomGames(env.DB);
-    if (!edited) await interactionFollowup(i, "The LFG state changed, but Discord did not refresh the card. Try again in a moment.");
+    if (!edited) await interactionFollowup(i, "The LFG state changed, but Discord could not refresh the card.");
   } catch (error) {
     const latest = await lfgSnapshot(env.DB, i.guild_id!, lfgId);
-    if (latest && messageId) await editChannelMessage(env, latest.lfg.channelId, messageId, lfgMessageData(latest));
+    if (latest) {
+      const restored = messageId
+        ? await editChannelMessage(env, latest.lfg.channelId, messageId, lfgMessageData(latest))
+        : false;
+      if (!restored) await editInteractionOriginal(i, lfgMessageData(latest));
+    }
     await interactionFollowup(i, error instanceof Error ? error.message : "Could not update this LFG.");
   }
 }
@@ -315,6 +321,17 @@ async function editChannelMessage(env: Env, channelId: string, messageId: string
     body: JSON.stringify(body),
   });
   if (!response.ok) console.error("Discord message edit failed", response.status, await response.text());
+  return response.ok;
+}
+
+async function editInteractionOriginal(i: DiscordInteraction, body: Record<string, unknown>): Promise<boolean> {
+  if (!i.application_id) return false;
+  const response = await fetch(`https://discord.com/api/v10/webhooks/${i.application_id}/${i.token}/messages/@original`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) console.error("Discord interaction edit failed", response.status, await response.text());
   return response.ok;
 }
 
@@ -344,7 +361,7 @@ async function createEvent(i: DiscordInteraction, env: Env, games: Game[], actor
     env.DB.prepare("INSERT INTO rsvps (event_id, user_id, status, updated_at) VALUES (?, ?, 'yes', ?)").bind(id, actor, now),
     ...(trigger ? [env.DB.prepare("INSERT INTO event_triggers (event_id, type, threshold) VALUES (?, ?, ?)").bind(id, trigger.type, trigger.threshold)] : []),
   ]);
-  if (trigger && await fireRsvpTrigger(env.DB, id)) ctx.waitUntil(notifyActivation(env, id));
+  if (trigger && await fireRsvpTrigger(env.DB, id)) ctx.waitUntil(onEventActivated(env, id));
   const data = await eventMessageData(env.DB, id, i.guild_id!);
   ctx.waitUntil(sendPostCommandControls(i, games, userZone.shouldPrompt));
   return json({ type: ResponseType.ChannelMessage, data });
@@ -512,7 +529,7 @@ async function component(i: DiscordInteraction, env: Env, ctx: ExecutionContext)
   if (action === "rsvp" && ["yes", "maybe", "no"].includes(status ?? "")) {
     await env.DB.prepare("INSERT INTO rsvps (event_id, user_id, status, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(event_id, user_id) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at")
       .bind(eventId, userId(i), status, new Date().toISOString()).run();
-    if (await fireRsvpTrigger(env.DB, eventId)) ctx.waitUntil(notifyActivation(env, eventId));
+    if (await fireRsvpTrigger(env.DB, eventId)) ctx.waitUntil(onEventActivated(env, eventId));
     return json({ type: ResponseType.UpdateMessage, data: await eventMessageData(env.DB, eventId, i.guild_id!) });
   }
   if (action === "vote") {
@@ -571,6 +588,11 @@ async function sendScheduledNotifications(env: Env, now = new Date()): Promise<v
       await deliver(env, event.id, event.user_id, kind, event.channel_id, content);
     }
   }
+}
+
+async function onEventActivated(env: Env, eventId: string): Promise<void> {
+  await notifyActivation(env, eventId);
+  await collectDeletedCustomGames(env.DB);
 }
 
 async function notifyActivation(env: Env, eventId: string): Promise<void> {
