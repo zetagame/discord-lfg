@@ -26,7 +26,6 @@ export async function currentListenedGames(db: D1Database, guildId: string, user
     FROM notification_actions
     JOIN games ON games.id = notification_actions.game_id
     WHERE notification_actions.guild_id = ? AND notification_actions.user_id = ?
-      AND games.deleted_at IS NULL
       AND (notification_actions.expires_at IS NULL OR julianday(notification_actions.expires_at) > julianday('now'))
       AND games.name LIKE ?
     ORDER BY notification_actions.created_at DESC, notification_actions.id DESC
