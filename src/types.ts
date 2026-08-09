@@ -32,4 +32,5 @@ export interface Game {
   id: string;
   name: string;
   providerId?: string;
+  coverUrl?: string;
 }

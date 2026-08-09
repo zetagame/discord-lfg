@@ -1,13 +1,17 @@
 import { IgdbProvider, GameSelectionService } from "./games";
+import { matchingListeners, recordNotificationAction } from "./notifications";
 import { InteractionType, ResponseType, json, option, userId, verifyDiscordRequest } from "./discord";
+import { effectiveTimeZone, parseDuration, parseWhen } from "./time";
 import type { DiscordInteraction, Env, Game } from "./types";
 
+const gameOption = { name: "games", description: "Games", type: 3, required: true, autocomplete: true };
+const durationOption = { name: "duration", description: "Duration", type: 3 };
 const commands = [
-  { name: "watch", description: "Listen for game alerts", options: [{ name: "games", description: "Games to watch (comma-separated)", type: 3, required: true, autocomplete: true }, { name: "minutes", description: "Temporarily mute alerts after watching", type: 4 }] },
-  { name: "unwatch", description: "Stop listening for game alerts", options: [{ name: "games", description: "Games to stop watching (comma-separated)", type: 3, required: true, autocomplete: true }] },
-  { name: "mute", description: "Temporarily stop game alerts", options: [{ name: "minutes", description: "Minutes to mute alerts", type: 4, required: true }] },
-  { name: "lfg", description: "Post a looking-for-group alert", options: [{ name: "games", description: "Games to play (comma-separated)", type: 3, required: true, autocomplete: true }, { name: "starts", description: "When play starts", type: 3 }, { name: "note", description: "Details for the group", type: 3 }] },
-  { name: "event", description: "Create a game event", options: [{ name: "games", description: "Games to choose from (comma-separated)", type: 3, required: true, autocomplete: true }, { name: "starts", description: "Event start time", type: 3, required: true }, { name: "title", description: "Event title", type: 3 }] },
+  { name: "listen", description: "Listen for game alerts", options: [gameOption, durationOption] },
+  { name: "unlisten", description: "Stop game alerts", options: [gameOption, durationOption] },
+  { name: "mute", description: "Stop game alerts", options: [gameOption, durationOption] },
+  { name: "lfg", description: "Post a looking-for-group alert", options: [gameOption, durationOption] },
+  { name: "create", description: "Create a game event", options: [gameOption, { name: "when", description: "When", type: 3, required: true }] },
 ];
 
 export default {
@@ -31,72 +35,65 @@ async function autocomplete(interaction: DiscordInteraction, games: GameSelectio
   const parts = String(focused?.value ?? "").split(",");
   const query = parts.at(-1)?.trim() ?? "";
   const prefix = parts.slice(0, -1).map((part) => part.trim()).filter(Boolean).join(", ");
-  const found = await games.search(interaction.guild_id!, query);
-  return json({ type: ResponseType.Autocomplete, data: { choices: found.slice(0, 25).map((game) => ({
-    name: game.name,
-    value: prefix ? `${prefix}, ${game.name}` : game.name,
+  const choices = await games.search(interaction.guild_id!, query);
+  if (query && !choices.some((game) => game.name.toLowerCase() === query.toLowerCase())) choices.push({ id: "custom", name: `Use "${query}"` });
+  return json({ type: ResponseType.Autocomplete, data: { choices: choices.slice(0, 25).map((game) => ({
+    name: game.id === "custom" ? game.name : game.name, value: prefix ? `${prefix}, ${game.id === "custom" ? query : game.name}` : game.id === "custom" ? query : game.name,
   })) } });
 }
 
-async function command(interaction: DiscordInteraction, env: Env, games: GameSelectionService): Promise<Response> {
-  const name = interaction.data?.name;
-  const actor = userId(interaction)!;
-  if (name === "mute") {
-    const minutes = Number(option(interaction, "minutes"));
-    if (!Number.isFinite(minutes) || minutes <= 0) return message("Enter a positive number of minutes.", true);
-    await env.DB.prepare("UPDATE subscriptions SET muted_until = datetime('now', ? || ' minutes') WHERE guild_id = ? AND user_id = ?")
-      .bind(String(minutes), interaction.guild_id, actor).run();
-    return message(`Alerts muted for ${minutes} minutes.`, true);
-  }
+async function command(i: DiscordInteraction, env: Env, games: GameSelectionService): Promise<Response> {
+  const name = i.data?.name;
+  const actor = userId(i)!;
   try {
-    const selected = await games.resolve(interaction.guild_id!, String(option(interaction, "games") ?? ""));
-    if (name === "watch") return watch(interaction, env, selected);
-    if (name === "unwatch") return unwatch(interaction, env, selected);
-    if (name === "lfg") return lfg(interaction, env, selected);
-    if (name === "event") return event(interaction, env, selected);
+    const selected = await games.resolve(i.guild_id!, String(option(i, "games") ?? ""));
+    if (name === "listen") return listen(i, env, selected, "listen");
+    if (name === "unlisten" || name === "mute") return listen(i, env, selected, "unlisten");
+    if (name === "lfg") return lfg(i, env, selected);
+    if (name === "create") return createEvent(i, env, selected, actor);
   } catch (error) {
-    return message(error instanceof Error ? error.message : "Could not select games.", true);
+    return message(error instanceof Error ? error.message : "Could not complete that command.", true);
   }
   return message("Unknown command.", true);
 }
 
-async function watch(i: DiscordInteraction, env: Env, games: Game[]): Promise<Response> {
-  const muteMinutes = Number(option(i, "minutes") ?? 0);
-  const muteUntil = muteMinutes > 0 ? new Date(Date.now() + muteMinutes * 60_000).toISOString() : null;
-  await env.DB.batch(games.map((game) => env.DB.prepare("INSERT INTO subscriptions (guild_id, user_id, game_id, muted_until) VALUES (?, ?, ?, ?) ON CONFLICT(guild_id, user_id, game_id) DO UPDATE SET muted_until = excluded.muted_until")
-    .bind(i.guild_id, userId(i), game.id, muteUntil)));
-  return message(`Watching: ${gameNames(games)}.`, true);
-}
-
-async function unwatch(i: DiscordInteraction, env: Env, games: Game[]): Promise<Response> {
-  await env.DB.batch(games.map((game) => env.DB.prepare("DELETE FROM subscriptions WHERE guild_id = ? AND user_id = ? AND game_id = ?")
-    .bind(i.guild_id, userId(i), game.id)));
-  return message(`Stopped watching: ${gameNames(games)}.`, true);
+async function listen(i: DiscordInteraction, env: Env, games: Game[], action: "listen" | "unlisten"): Promise<Response> {
+  const duration = parseDuration(String(option(i, "duration") ?? ""));
+  if (option(i, "duration") && !duration) return message("Use a duration such as 30m, 2h, 3d, tonight, or this weekend.", true);
+  await recordNotificationAction(env.DB, i.guild_id!, userId(i)!, games.map((game) => game.id), action, duration);
+  const word = action === "listen" ? "Listening for" : "Not listening for";
+  return message(`${word} ${gameNames(games)}${duration ? ` until ${duration.toISOString()}` : ""}.`, true);
 }
 
 async function lfg(i: DiscordInteraction, env: Env, games: Game[]): Promise<Response> {
-  const starts = String(option(i, "starts") ?? "");
-  const note = String(option(i, "note") ?? "");
-  await env.DB.prepare("INSERT INTO lfg_posts (id, guild_id, channel_id, author_id, game_ids, starts_at, note) VALUES (?, ?, ?, ?, ?, ?, ?)")
-    .bind(crypto.randomUUID(), i.guild_id, i.channel_id, userId(i), JSON.stringify(games.map((game) => game.id)), starts || null, note || null).run();
-  const placeholders = games.map(() => "?").join(",");
-  const watchers = await env.DB.prepare(
-    `SELECT DISTINCT user_id FROM subscriptions WHERE guild_id = ? AND game_id IN (${placeholders}) AND (muted_until IS NULL OR julianday(muted_until) <= julianday('now'))`,
-  ).bind(i.guild_id, ...games.map((game) => game.id)).all<{ user_id: string }>();
-  const mentions = watchers.results.map((watcher) => `<@${watcher.user_id}>`).join(" ");
-  return publicEmbed("LFG", `${gameNames(games)}${starts ? `\nStarts: ${starts}` : ""}${note ? `\n${note}` : ""}${mentions ? `\nWatchers: ${mentions}` : ""}`);
+  const duration = option(i, "duration") ? parseDuration(String(option(i, "duration"))) : new Date(Date.now() + 2 * 3_600_000);
+  if (!duration) return message("Use a duration such as 30m, 2h, 3d, tonight, or this weekend.", true);
+  const id = crypto.randomUUID();
+  await env.DB.batch([
+    env.DB.prepare("INSERT INTO lfgs (id, guild_id, channel_id, author_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .bind(id, i.guild_id, i.channel_id, userId(i), duration.toISOString(), new Date().toISOString()),
+    ...games.map((game) => env.DB.prepare("INSERT INTO lfg_games (lfg_id, game_id) VALUES (?, ?)").bind(id, game.id)),
+  ]);
+  const listeners = await matchingListeners(env.DB, i.guild_id!, games.map((game) => game.id), userId(i)!);
+  return publicEmbed("LFG", `${gameNames(games)}\nRelevant until ${duration.toISOString()}${listeners.length ? `\n${listeners.map((id) => `<@${id}>`).join(" ")}` : ""}`);
 }
 
-async function event(i: DiscordInteraction, env: Env, games: Game[]): Promise<Response> {
+async function createEvent(i: DiscordInteraction, env: Env, games: Game[], actor: string): Promise<Response> {
+  const timeZone = await userTimeZone(env.DB, i.guild_id!, actor);
+  const whenInput = String(option(i, "when") ?? "");
+  const startsAt = parseWhen(whenInput, timeZone);
+  const trigger = parseTrigger(whenInput);
+  if (!startsAt && !trigger) return message("Use a scheduled date/time, or a trigger such as \"3 yes RSVPs\".", true);
   const id = crypto.randomUUID();
-  const starts = String(option(i, "starts"));
-  const title = String(option(i, "title") ?? "Game night");
-  await env.DB.prepare("INSERT INTO events (id, guild_id, channel_id, author_id, title, game_ids, starts_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-    .bind(id, i.guild_id, i.channel_id, userId(i), title, JSON.stringify(games.map((game) => game.id)), starts).run();
-  return json({ type: ResponseType.ChannelMessage, data: { embeds: [{ title, description: `Games: ${gameNames(games)}\nStarts: ${starts}` }], components: [
-    { type: 1, components: ["going", "maybe", "declined"].map((status) => ({ type: 2, style: status === "going" ? 3 : 2, label: status[0].toUpperCase() + status.slice(1), custom_id: `rsvp:${id}:${status}` })) },
-    { type: 1, components: [{ type: 3, custom_id: `vote:${id}`, placeholder: "Vote for games", min_values: 1, max_values: games.length, options: games.map((game) => ({ label: game.name, value: game.id })) }] },
-  ] } });
+  await env.DB.batch([
+    env.DB.prepare("INSERT INTO events (id, guild_id, channel_id, author_id, title, game_ids, starts_at, when_input) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .bind(id, i.guild_id, i.channel_id, actor, "Game night", JSON.stringify(games.map((game) => game.id)), (startsAt ?? new Date()).toISOString(), whenInput),
+    ...games.map((game) => env.DB.prepare("INSERT INTO event_games (event_id, game_id) VALUES (?, ?)").bind(id, game.id)),
+    ...(trigger ? [env.DB.prepare("INSERT INTO event_triggers (event_id, type, threshold) VALUES (?, ?, ?)").bind(id, trigger.type, trigger.threshold)] : []),
+  ]);
+  const components: unknown[] = [{ type: 1, components: [["yes", 3], ["maybe", 2], ["no", 4]].map(([status, style]) => ({ type: 2, style, label: String(status).replace(/^./, (letter) => letter.toUpperCase()), custom_id: `rsvp:${id}:${status}` })) }];
+  if (games.length > 1) components.push({ type: 1, components: [{ type: 3, custom_id: `vote:${id}`, placeholder: "Vote for games", min_values: 1, max_values: games.length, options: games.map((game) => ({ label: game.name, value: game.id })) }] });
+  return json({ type: ResponseType.ChannelMessage, data: { embeds: [{ title: "Game night", description: `Games: ${gameNames(games)}\n${trigger ? `Trigger: ${whenInput}` : `When: ${startsAt!.toISOString()} (${timeZone})`}` }], components } });
 }
 
 async function component(i: DiscordInteraction, env: Env): Promise<Response> {
@@ -104,23 +101,31 @@ async function component(i: DiscordInteraction, env: Env): Promise<Response> {
   if (!eventId) return message("Invalid event action.", true);
   const event = await env.DB.prepare("SELECT id FROM events WHERE id = ? AND guild_id = ?").bind(eventId, i.guild_id).first();
   if (!event) return message("This event is not available in this server.", true);
-  if (action === "rsvp" && status) {
-    await env.DB.prepare("INSERT INTO event_rsvps (event_id, user_id, status) VALUES (?, ?, ?) ON CONFLICT(event_id, user_id) DO UPDATE SET status = excluded.status")
-      .bind(eventId, userId(i), status).run();
+  if (action === "rsvp" && ["yes", "maybe", "no"].includes(status ?? "")) {
+    await env.DB.prepare("INSERT INTO rsvps (event_id, user_id, status, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(event_id, user_id) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at")
+      .bind(eventId, userId(i), status, new Date().toISOString()).run();
     return message(`RSVP updated to ${status}.`, true);
   }
   if (action === "vote") {
     const values = i.data?.values ?? [];
-    await env.DB.batch([env.DB.prepare("DELETE FROM event_votes WHERE event_id = ? AND user_id = ?").bind(eventId, userId(i)), ...values.map((gameId) => env.DB.prepare("INSERT INTO event_votes (event_id, user_id, game_id) VALUES (?, ?, ?)").bind(eventId, userId(i), gameId))]);
+    const valid = await env.DB.prepare(`SELECT game_id FROM event_games WHERE event_id = ? AND game_id IN (${values.map(() => "?").join(",") || "NULL"})`).bind(eventId, ...values).all<{ game_id: string }>();
+    if (valid.results.length !== values.length) return message("Invalid game selection.", true);
+    await env.DB.batch([env.DB.prepare("DELETE FROM event_game_votes WHERE event_id = ? AND user_id = ?").bind(eventId, userId(i)), ...values.map((gameId) => env.DB.prepare("INSERT INTO event_game_votes (event_id, user_id, game_id) VALUES (?, ?, ?)").bind(eventId, userId(i), gameId))]);
     return message("Game vote recorded.", true);
   }
   return message("Invalid event action.", true);
 }
 
-function message(content: string, ephemeral: boolean): Response {
-  return json({ type: ResponseType.ChannelMessage, data: { content, flags: ephemeral ? 64 : undefined } });
+async function userTimeZone(db: D1Database, guildId: string, userId: string): Promise<string> {
+  const user = await db.prepare("SELECT timezone FROM users WHERE guild_id = ? AND user_id = ?").bind(guildId, userId).first<{ timezone?: string }>();
+  await db.prepare("INSERT OR IGNORE INTO users (guild_id, user_id, timezone_prompted_at) VALUES (?, ?, ?)").bind(guildId, userId, new Date().toISOString()).run();
+  return effectiveTimeZone(user?.timezone);
 }
-function publicEmbed(title: string, description: string): Response {
-  return json({ type: ResponseType.ChannelMessage, data: { embeds: [{ title, description }] } });
+
+function parseTrigger(value: string): { type: string; threshold: number } | undefined {
+  const match = /^(\d+)\s+(people online|listeners online|yes rsvps|yes-or-maybe rsvps)$/i.exec(value.trim());
+  return match ? { threshold: Number(match[1]), type: match[2].toLowerCase().replaceAll(" ", "_") } : undefined;
 }
+function message(content: string, ephemeral: boolean): Response { return json({ type: ResponseType.ChannelMessage, data: { content, flags: ephemeral ? 64 : undefined } }); }
+function publicEmbed(title: string, description: string): Response { return json({ type: ResponseType.ChannelMessage, data: { embeds: [{ title, description }] } }); }
 function gameNames(games: Game[]): string { return games.map((game) => game.name).join(", "); }
