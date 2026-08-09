@@ -62,7 +62,7 @@ export function parseWhen(input: string, timeZone: string, now = new Date()): Da
     if (hour < 1 || hour > 12 || minute < 0 || minute > 59) return undefined;
     if (relativeClock[4] === "pm" && hour < 12) hour += 12;
     if (relativeClock[4] === "am" && hour === 12) hour = 0;
-    return zonedUtc(
+    return zonedUtcChecked(
       local.year,
       local.month,
       local.day + (relativeClock[1] === "tomorrow" ? 1 : 0),
@@ -77,8 +77,8 @@ export function parseWhen(input: string, timeZone: string, now = new Date()): Da
     const [year, month, day] = value.slice(0, 10).split("-").map(Number);
     const hour = Number(date[1]);
     const minute = Number(date[2] ?? 0);
-    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return undefined;
-    return zonedUtc(year!, month!, day!, hour, minute, timeZone);
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || !isValidCalendarDate(year!, month!, day!)) return undefined;
+    return zonedUtcChecked(year!, month!, day!, hour, minute, timeZone);
   }
   return parseDuration(value, timeZone, now);
 }
@@ -105,25 +105,56 @@ function parseUntil(value: string, timeZone: string, now: Date): Date | undefine
     return undefined;
   }
   const local = localParts(now, timeZone);
-  let result = zonedUtc(local.year, local.month, local.day, hour, minute, timeZone);
-  if (result <= now) result = zonedUtc(local.year, local.month, local.day + 1, hour, minute, timeZone);
+  let result = zonedUtcChecked(local.year, local.month, local.day, hour, minute, timeZone);
+  if (!result) return undefined;
+  if (result <= now) result = zonedUtcChecked(local.year, local.month, local.day + 1, hour, minute, timeZone);
   return result;
 }
 
 function localParts(date: Date, timeZone: string) {
-  const parts = new Intl.DateTimeFormat("en-US", { timeZone, year: "numeric", month: "numeric", day: "numeric", hour: "numeric", hourCycle: "h23", minute: "numeric" }).formatToParts(date);
+  const { year, month, day, hour } = localDateTimeParts(date, timeZone);
+  return { year, month, day, hour };
+}
+
+function localDateTimeParts(date: Date, timeZone: string) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+    hour: "numeric",
+    hourCycle: "h23",
+    minute: "numeric",
+  }).formatToParts(date);
   const get = (type: string) => Number(parts.find((part) => part.type === type)?.value);
-  return { year: get("year"), month: get("month"), day: get("day"), hour: get("hour") };
+  return { year: get("year"), month: get("month"), day: get("day"), hour: get("hour"), minute: get("minute") };
 }
 
 function zonedUtc(year: number, month: number, day: number, hour: number, minute: number, timeZone: string, milliseconds = 0): Date {
   let timestamp = Date.UTC(year, month - 1, day, hour, minute);
   for (let i = 0; i < 2; i++) {
-    const parts = new Intl.DateTimeFormat("en-US", { timeZone, year: "numeric", month: "numeric", day: "numeric", hour: "numeric", hourCycle: "h23", minute: "numeric" }).formatToParts(new Date(timestamp));
-    const get = (type: string) => Number(parts.find((part) => part.type === type)?.value);
-    timestamp += Date.UTC(year, month - 1, day, hour, minute) - Date.UTC(get("year"), get("month") - 1, get("day"), get("hour"), get("minute"));
+    const parts = localDateTimeParts(new Date(timestamp), timeZone);
+    timestamp += Date.UTC(year, month - 1, day, hour, minute) - Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute);
   }
   return new Date(timestamp + (milliseconds ? 59_000 + milliseconds : 0));
+}
+
+function zonedUtcChecked(year: number, month: number, day: number, hour: number, minute: number, timeZone: string): Date | undefined {
+  const result = zonedUtc(year, month, day, hour, minute, timeZone);
+  const expected = new Date(Date.UTC(year, month - 1, day, hour, minute));
+  const actual = localDateTimeParts(result, timeZone);
+  return actual.year === expected.getUTCFullYear()
+      && actual.month === expected.getUTCMonth() + 1
+      && actual.day === expected.getUTCDate()
+      && actual.hour === expected.getUTCHours()
+      && actual.minute === expected.getUTCMinutes()
+    ? result
+    : undefined;
+}
+
+function isValidCalendarDate(year: number, month: number, day: number): boolean {
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() + 1 === month && date.getUTCDate() === day;
 }
 
 function localEndOfDay(value: Date, timeZone: string): Date {
