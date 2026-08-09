@@ -30,6 +30,7 @@ const PANEL_ATTEMPT_TIMEOUT_MS = 3000;
 const PANEL_RETRIES = 2;
 const IS_COMPONENTS_V2 = 1 << 15;
 const PANEL_TEXT_LIMIT = 3900;
+const ACTIVE_PANEL_ACCENT = 0x57F287;
 
 type PanelEditResult = "updated" | "missing";
 
@@ -184,6 +185,7 @@ async function gamePanelData(env: Env, snapshot: GameGroupSnapshot, signal: Abor
     embeds: [],
     components: [{
       type: 17,
+      accent_color: ACTIVE_PANEL_ACCENT,
       components: [
         primary,
         {
@@ -198,7 +200,7 @@ async function gamePanelData(env: Env, snapshot: GameGroupSnapshot, signal: Abor
 function panelText(snapshot: GameGroupSnapshot, members: string[]): string {
   const heading = `### ${snapshot.game.name}\n**${snapshot.activeUserIds.length} in group**`;
   const upcoming = snapshot.upcomingEvent
-    ? `\n\n**Upcoming event**\n${snapshot.upcomingEvent.title} · ${discordTimestamp(new Date(snapshot.upcomingEvent.startsAt))}\n${snapshot.upcomingEvent.yesCount} going`
+    ? `\n\n-# Upcoming event\n**${snapshot.upcomingEvent.title}** · ${discordTimestamp(new Date(snapshot.upcomingEvent.startsAt))}\n-# ${snapshot.upcomingEvent.yesCount} going`
     : "";
   const memberBudget = Math.max(0, PANEL_TEXT_LIMIT - heading.length - upcoming.length - 1);
   const visible: string[] = [];
