@@ -58,7 +58,8 @@ export function parseWhen(input: string, timeZone: string, now = new Date()): Da
   if (relativeClock) {
     const local = localParts(now, timeZone);
     let hour = Number(relativeClock[2]);
-    if (hour < 1 || hour > 12) return undefined;
+    const minute = Number(relativeClock[3] ?? 0);
+    if (hour < 1 || hour > 12 || minute < 0 || minute > 59) return undefined;
     if (relativeClock[4] === "pm" && hour < 12) hour += 12;
     if (relativeClock[4] === "am" && hour === 12) hour = 0;
     return zonedUtc(
@@ -66,7 +67,7 @@ export function parseWhen(input: string, timeZone: string, now = new Date()): Da
       local.month,
       local.day + (relativeClock[1] === "tomorrow" ? 1 : 0),
       hour,
-      Number(relativeClock[3] ?? 0),
+      minute,
       timeZone,
     );
   }
@@ -74,7 +75,10 @@ export function parseWhen(input: string, timeZone: string, now = new Date()): Da
   const date = /^\d{4}-\d{2}-\d{2}[ t](\d{1,2})(?::(\d{2}))?$/.exec(value);
   if (date) {
     const [year, month, day] = value.slice(0, 10).split("-").map(Number);
-    return zonedUtc(year!, month!, day!, Number(date[1]), Number(date[2] ?? 0), timeZone);
+    const hour = Number(date[1]);
+    const minute = Number(date[2] ?? 0);
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return undefined;
+    return zonedUtc(year!, month!, day!, hour, minute, timeZone);
   }
   return parseDuration(value, timeZone, now);
 }
@@ -91,11 +95,18 @@ function parseUntil(value: string, timeZone: string, now: Date): Date | undefine
   const time = /^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/.exec(value);
   if (!time) return undefined;
   let hour = Number(time[1]);
-  if (time[3] === "pm" && hour < 12) hour += 12;
-  if (time[3] === "am" && hour === 12) hour = 0;
+  const minute = Number(time[2] ?? 0);
+  if (minute < 0 || minute > 59) return undefined;
+  if (time[3]) {
+    if (hour < 1 || hour > 12) return undefined;
+    if (time[3] === "pm" && hour < 12) hour += 12;
+    if (time[3] === "am" && hour === 12) hour = 0;
+  } else if (hour < 0 || hour > 23) {
+    return undefined;
+  }
   const local = localParts(now, timeZone);
-  let result = zonedUtc(local.year, local.month, local.day, hour, Number(time[2] ?? 0), timeZone);
-  if (result <= now) result = zonedUtc(local.year, local.month, local.day + 1, hour, Number(time[2] ?? 0), timeZone);
+  let result = zonedUtc(local.year, local.month, local.day, hour, minute, timeZone);
+  if (result <= now) result = zonedUtc(local.year, local.month, local.day + 1, hour, minute, timeZone);
   return result;
 }
 
