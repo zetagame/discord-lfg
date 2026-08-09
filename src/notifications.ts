@@ -22,7 +22,7 @@ export async function currentListenedGames(db: D1Database, guildId: string, user
   const result = await db.prepare(`
     SELECT notification_actions.id, notification_actions.game_id, notification_actions.action, notification_actions.created_at,
       games.name, games.provider_id AS providerId, games.cover_url AS coverUrl,
-      games.created_by_user_id AS createdByUserId
+      games.created_by_user_id AS createdByUserId, games.deleted_at AS deletedAt
     FROM notification_actions
     JOIN games ON games.id = notification_actions.game_id
     WHERE notification_actions.guild_id = ? AND notification_actions.user_id = ?
@@ -38,6 +38,7 @@ export async function currentListenedGames(db: D1Database, guildId: string, user
     providerId?: string;
     coverUrl?: string;
     createdByUserId?: string;
+    deletedAt?: string;
   }>();
   const latest = new Map<string, (typeof result.results)[number]>();
   for (const row of result.results) {
@@ -51,6 +52,7 @@ export async function currentListenedGames(db: D1Database, guildId: string, user
       providerId: row.providerId,
       coverUrl: row.coverUrl,
       createdByUserId: row.createdByUserId,
+      deletedAt: row.deletedAt,
     }));
 }
 
