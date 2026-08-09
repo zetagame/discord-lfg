@@ -67,26 +67,20 @@ export default {
 
 async function autocomplete(interaction: DiscordInteraction, games: GameSelectionService): Promise<Response> {
   const focused = interaction.data?.options?.find((item) => item.focused);
-  const parts = String(focused?.value ?? "").split(",");
-  const query = parts.at(-1)?.trim() ?? "";
-  const selectedNames = parts.slice(0, -1).map((part) => part.trim()).filter(Boolean);
-  const prefix = selectedNames.join(", ");
+  const query = String(focused?.value ?? "").trim();
   const choices = await games.search(interaction.guild_id!, query);
-  const filtered = choices.filter((game) => !selectedNames.some((name) => name.toLowerCase() === game.name.toLowerCase()));
-  if (query && !filtered.some((game) => game.name.toLowerCase() === query.toLowerCase())) {
-    filtered.push({ id: "custom", name: `Use "${query}"` });
+  if (query && !choices.some((game) => game.name.toLowerCase() === query.toLowerCase())) {
+    choices.push({ id: "custom", name: `Use "${query}"` });
   }
   return json({
     type: ResponseType.Autocomplete,
     data: {
-      choices: filtered.slice(0, 25).map((game) => {
+      choices: choices.slice(0, 25).map((game) => {
         const customFallback = game.id === "custom";
         const suffix = !customFallback && !game.providerId ? " · custom" : "";
         return {
           name: `${game.name}${suffix}`.slice(0, 100),
-          value: prefix
-            ? `${prefix}, ${customFallback ? query : game.name}`
-            : customFallback ? query : game.name,
+          value: customFallback ? query : game.name,
         };
       }),
     },
