@@ -46,6 +46,19 @@ export async function currentListenedGames(db: D1Database, guildId: string, user
     .map((row) => ({ id: row.game_id, name: row.name, providerId: row.providerId, coverUrl: row.coverUrl }));
 }
 
+export async function matchingLfgCreators(db: D1Database, guildId: string, gameIds: string[], excludedUserId: string): Promise<string[]> {
+  if (!gameIds.length) return [];
+  const placeholders = gameIds.map(() => "?").join(",");
+  const result = await db.prepare(`
+    SELECT DISTINCT lfgs.author_id
+    FROM lfgs
+    JOIN lfg_games ON lfg_games.lfg_id = lfgs.id
+    WHERE lfgs.guild_id = ? AND lfg_games.game_id IN (${placeholders}) AND lfgs.author_id != ?
+      AND julianday(lfgs.expires_at) > julianday('now')
+  `).bind(guildId, ...gameIds, excludedUserId).all<{ author_id: string }>();
+  return result.results.map((row) => row.author_id);
+}
+
 export async function matchingListeners(db: D1Database, guildId: string, gameIds: string[], excludedUserId: string): Promise<string[]> {
   if (!gameIds.length) return [];
   const placeholders = gameIds.map(() => "?").join(",");
