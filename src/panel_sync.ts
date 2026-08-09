@@ -106,7 +106,7 @@ async function syncGamePanelAttempt(
   if (!snapshot) return;
   const projection = await loadPanelProjectionState(env.DB, snapshot.group.id);
   const targetRevision = projection?.revision ?? 0;
-  const eligible = panelEligible(snapshot);
+  const eligible = await panelEligible(env, snapshot);
   const panelChannel = snapshot.activeUserIds.length > 0
     ? snapshot.group.channelId ?? preferredChannelId ?? snapshot.upcomingEvent?.channelId
     : snapshot.upcomingEvent?.channelId ?? snapshot.group.channelId ?? preferredChannelId;
@@ -114,7 +114,7 @@ async function syncGamePanelAttempt(
   if (!eligible) {
     if (snapshot.group.discordMessageId && snapshot.group.channelId) {
       const latest = await loadGameGroupSnapshot(env.DB, guildId, gameId);
-      if (latest && panelEligible(latest)) throw new RetryableActionError("Panel became eligible during deletion");
+      if (latest && await panelEligible(env, latest)) throw new RetryableActionError("Panel became eligible during deletion");
       await deletePanelMessage(env, snapshot.group.channelId, snapshot.group.discordMessageId, signal);
       await clearPanelMessage(env.DB, snapshot.group.id, snapshot.group.discordMessageId);
       await clearPanelCreateNonce(env.DB, snapshot.group.id);
@@ -227,8 +227,18 @@ function panelText(snapshot: GameGroupSnapshot, members: string[]): string {
   return `${heading}${visible.length ? `\n${visible.join("\n")}` : ""}${upcoming}`;
 }
 
-function panelEligible(snapshot: GameGroupSnapshot): boolean {
-  return snapshot.activeUserIds.length > 0 || Boolean(snapshot.upcomingEvent);
+async function panelEligible(env: Env, snapshot: GameGroupSnapshot): Promise<boolean> {
+  if (snapshot.upcomingEvent) return true;
+  if (snapshot.game.providerId === ANY_GAME_PROVIDER_ID) return snapshot.activeUserIds.length > 0;
+  const direct = await env.DB.prepare(`
+    SELECT 1
+    FROM group_members
+    WHERE group_id = ?
+      AND paused_at IS NULL
+      AND julianday(expires_at) > julianday('now')
+    LIMIT 1
+  `).bind(snapshot.group.id).first();
+  return Boolean(direct);
 }
 
 async function createPanelMessage(
