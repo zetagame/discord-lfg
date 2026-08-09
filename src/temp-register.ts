@@ -15,7 +15,7 @@ const commands = [
 
 export default {
   ...worker,
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/register-commands") {
       if (!env.DISCORD_BOT_TOKEN) return new Response("DISCORD_BOT_TOKEN is not configured.", { status: 500 });
@@ -34,6 +34,6 @@ export default {
       return new Response("Registered Discord slash commands. This temporary endpoint can now be removed.");
     }
 
-    return worker.fetch(request, env, ctx);
+    return worker.fetch(request, env);
   },
 } satisfies ExportedHandler<Env>;
