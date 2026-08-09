@@ -23,7 +23,17 @@ import { ResponseType, json, userId } from "./discord";
 import { discordTimestamp } from "./time";
 import type { DiscordInteraction, Env, Game } from "./types";
 
-const ANY_GAME_PROVIDER_ID = "system:any";
+const IS_COMPONENTS_V2 = 1 << 15;
+const EPHEMERAL = 1 << 6;
+const MAX_MANAGER_ROWS = 6;
+
+type ManagerAction = "pause" | "resume" | "stop";
+type ManagedLfg = { game: Game; member: GroupMember };
+
+type LoadingState = {
+  gameId: string;
+  action: ManagerAction;
+};
 
 export { syncGamePanelsForEvent, syncSharedGameGroups } from "./panel_sync";
 
@@ -52,15 +62,18 @@ export async function handleLfgCommand(
     ).catch((error) => console.error("Write-complete LFG panel projection failed", error)));
   }
 
-  const first = updates[0];
-  const primarySession = i.application_id
-    ? await beginControlSession(env.DB, i.guild_id!, first.snapshot.game.id, actor, i.application_id, i.token)
+  const manager = await loadManagedLfgs(env.DB, i.guild_id!, actor);
+  const session = i.application_id
+    ? await beginControlSession(env.DB, i.guild_id!, actor, i.application_id, i.token)
     : undefined;
-  ctx.waitUntil(afterMembershipUpdates(env, i, updates, actor, primarySession));
+  ctx.waitUntil(afterMembershipUpdates(env, i, updates, actor, session));
 
   return json({
     type: ResponseType.ChannelMessage,
-    data: { ...memberControlData(first.snapshot.game, first.member, undefined, Boolean(primarySession)), flags: 64 },
+    data: {
+      ...managerData(manager, undefined, Boolean(session)),
+      flags: EPHEMERAL | IS_COMPONENTS_V2,
+    },
   });
 }
 
@@ -69,23 +82,31 @@ async function afterMembershipUpdates(
   i: DiscordInteraction,
   updates: MembershipUpdate[],
   actor: string,
-  primarySession?: PendingControlSession,
+  session?: PendingControlSession,
 ): Promise<void> {
-  if (primarySession && i.application_id) {
-    await finalizeOriginalControl(env, i, updates[0].snapshot.game.id, actor, primarySession);
-  }
+  if (session && i.application_id) await finalizeOriginalControl(env, i, actor, session);
   await notifyGroupOverlaps(env, i.channel_id!, actor, updates);
-  for (const update of updates.slice(1)) {
-    await sendTrackedControlFollowup(env, i, update.snapshot.game, update.member, actor);
-  }
 }
 
 export async function handleGroupComponent(i: DiscordInteraction, env: Env, ctx: ExecutionContext): Promise<Response> {
   const parts = i.data?.custom_id?.split(":") ?? [];
-  const action = parts[1] as "manage" | "pause" | "resume" | "stop" | "busy" | undefined;
+  const action = parts[1] as "manage" | ManagerAction | "busy" | undefined;
   const gameId = parts[2];
   const actor = userId(i);
   if (!i.guild_id || !actor || !gameId || !action || action === "busy") return ephemeral("This group action is not available.");
+
+  if (action === "manage") {
+    const manager = await loadManagedLfgs(env.DB, i.guild_id, actor);
+    if (!manager.length) return ephemeral("You don't have any active LFGs. Use /lfg to start one.");
+    if (!i.application_id) return ephemeral("Could not open your LFG controls.");
+    const session = await beginControlSession(env.DB, i.guild_id, actor, i.application_id, i.token);
+    if (!session) return ephemeral("Your LFG controls are already opening.");
+    ctx.waitUntil(finalizeOriginalControl(env, i, actor, session));
+    return json({
+      type: ResponseType.ChannelMessage,
+      data: { ...managerData(manager), flags: EPHEMERAL | IS_COMPONENTS_V2 },
+    });
+  }
 
   const group = await loadGameGroup(env.DB, i.guild_id, gameId);
   const snapshot = await loadGameGroupSnapshot(env.DB, i.guild_id, gameId);
@@ -93,60 +114,46 @@ export async function handleGroupComponent(i: DiscordInteraction, env: Env, ctx:
   const member = await loadGroupMember(env.DB, group.id, actor);
   const state = groupMemberState(member);
 
-  if (action === "manage") {
-    let controlGame = snapshot.game;
-    let controlMember = member;
-    let controlGameId = gameId;
-    if (state === "missing" || state === "expired") {
-      const wildcard = await activeAnyMembership(env.DB, i.guild_id, actor);
-      if (!wildcard) return ephemeral(`You're not currently in **${snapshot.game.name}**. Use /lfg to join or extend the group.`);
-      controlGame = wildcard.game;
-      controlMember = wildcard.member;
-      controlGameId = wildcard.game.id;
-    }
-    if (!i.application_id) return ephemeral("Could not open your LFG controls.");
-    const session = await beginControlSession(env.DB, i.guild_id, controlGameId, actor, i.application_id, i.token);
-    if (!session) return ephemeral("Your LFG controls are already opening.");
-    ctx.waitUntil(finalizeOriginalControl(env, i, controlGameId, actor, session));
-    return json({ type: ResponseType.ChannelMessage, data: { ...memberControlData(controlGame, controlMember), flags: 64 } });
-  }
-
   if (action === "pause" && state !== "active") return ephemeral("You are not actively looking for this game.");
   if (action === "resume" && state !== "paused") return ephemeral("You are not paused for this game.");
   if (action === "stop" && state !== "active" && state !== "paused") return ephemeral("You are no longer looking for this game.");
 
+  const manager = await loadManagedLfgs(env.DB, i.guild_id, actor);
   ctx.waitUntil(completeMemberAction(env, i, snapshot.game, action));
-  return json({ type: ResponseType.UpdateMessage, data: memberControlData(snapshot.game, member, action) });
+  return json({
+    type: ResponseType.UpdateMessage,
+    data: managerData(manager, { gameId, action }),
+  });
 }
 
-async function activeAnyMembership(
-  db: D1Database,
-  guildId: string,
-  actor: string,
-): Promise<{ game: Game; member: GroupMember } | undefined> {
-  const row = await db.prepare(`
+async function loadManagedLfgs(db: D1Database, guildId: string, actor: string): Promise<ManagedLfg[]> {
+  const rows = await db.prepare(`
     SELECT games.id, games.name, games.provider_id AS providerId, games.cover_url AS coverUrl,
-      group_members.expires_at AS expiresAt
-    FROM games
-    JOIN game_groups ON game_groups.game_id = games.id AND game_groups.guild_id = games.guild_id
-    JOIN group_members ON group_members.group_id = game_groups.id
-    WHERE games.guild_id = ? AND games.provider_id = ?
+      games.created_by_user_id AS createdByUserId,
+      group_members.expires_at AS expiresAt, group_members.paused_at AS pausedAt
+    FROM group_members
+    JOIN game_groups ON game_groups.id = group_members.group_id
+    JOIN games ON games.id = game_groups.game_id
+    WHERE game_groups.guild_id = ?
       AND group_members.user_id = ?
-      AND group_members.paused_at IS NULL
       AND julianday(group_members.expires_at) > julianday('now')
-    LIMIT 1
-  `).bind(guildId, ANY_GAME_PROVIDER_ID, actor).first<Game & { expiresAt: string }>();
-  if (!row) return undefined;
-  return {
-    game: { id: row.id, name: row.name, providerId: row.providerId, coverUrl: row.coverUrl },
-    member: { userId: actor, expiresAt: row.expiresAt },
-  };
+    ORDER BY games.name COLLATE NOCASE
+  `).bind(guildId, actor).all<Game & { expiresAt: string; pausedAt?: string }>();
+  return rows.results.map((row) => ({
+    game: {
+      id: row.id,
+      name: row.name,
+      providerId: row.providerId,
+      coverUrl: row.coverUrl,
+      createdByUserId: row.createdByUserId,
+    },
+    member: { userId: actor, expiresAt: row.expiresAt, pausedAt: row.pausedAt },
+  }));
 }
 
 async function finalizeOriginalControl(
   env: Env,
   i: DiscordInteraction,
-  gameId: string,
   actor: string,
   pending: PendingControlSession,
 ): Promise<void> {
@@ -154,18 +161,17 @@ async function finalizeOriginalControl(
   const messageId = await interactionOriginalMessageId(i.application_id, i.token);
   if (!messageId) {
     await deleteOriginalWebhookMessage(i.application_id, i.token);
-    await cancelControlSessionOpening(env.DB, i.guild_id, gameId, actor, pending.nonce);
+    await cancelControlSessionOpening(env.DB, i.guild_id, actor, pending.nonce);
     return;
   }
-  if (!await controlStillValid(env.DB, i.guild_id, gameId, actor)) {
+  if (!await controlStillValid(env.DB, i.guild_id, actor)) {
     await deleteOriginalWebhookMessage(i.application_id, i.token);
-    await cancelControlSessionOpening(env.DB, i.guild_id, gameId, actor, pending.nonce);
+    await cancelControlSessionOpening(env.DB, i.guild_id, actor, pending.nonce);
     return;
   }
   await finishControlOpening(
     env,
     i.guild_id,
-    gameId,
     actor,
     pending,
     messageId,
@@ -173,63 +179,13 @@ async function finalizeOriginalControl(
   );
 }
 
-async function sendTrackedControlFollowup(
-  env: Env,
-  i: DiscordInteraction,
-  game: Game,
-  member: GroupMember | undefined,
-  actor: string,
-): Promise<void> {
-  if (!i.application_id || !i.guild_id) return;
-  const pending = await beginControlSession(env.DB, i.guild_id, game.id, actor, i.application_id, i.token);
-  if (!pending) return;
-
-  let messageId: string | undefined;
-  try {
-    const response = await fetch(`https://discord.com/api/v10/webhooks/${i.application_id}/${i.token}?wait=true`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ ...memberControlData(game, member), flags: 64 }),
-    });
-    if (!response.ok) {
-      console.error("Discord tracked control followup failed", response.status, await response.text());
-      await cancelControlSessionOpening(env.DB, i.guild_id, game.id, actor, pending.nonce);
-      return;
-    }
-    messageId = (await response.json() as { id?: string }).id;
-    if (!messageId || !await controlStillValid(env.DB, i.guild_id, game.id, actor)) {
-      if (messageId) await deleteWebhookMessage(i.application_id, i.token, messageId);
-      await cancelControlSessionOpening(env.DB, i.guild_id, game.id, actor, pending.nonce);
-      return;
-    }
-    await finishControlOpening(
-      env,
-      i.guild_id,
-      game.id,
-      actor,
-      pending,
-      messageId,
-      () => deleteWebhookMessage(i.application_id!, i.token, messageId!),
-    );
-  } catch (error) {
-    console.error("Discord tracked control followup request failed", error);
-    if (messageId) await deleteWebhookMessage(i.application_id, i.token, messageId);
-    await cancelControlSessionOpening(env.DB, i.guild_id, game.id, actor, pending.nonce);
-  }
-}
-
-async function controlStillValid(db: D1Database, guildId: string, gameId: string, actor: string): Promise<boolean> {
-  const group = await loadGameGroup(db, guildId, gameId);
-  if (!group) return false;
-  const member = await loadGroupMember(db, group.id, actor);
-  const state = groupMemberState(member);
-  return state === "active" || state === "paused";
+async function controlStillValid(db: D1Database, guildId: string, actor: string): Promise<boolean> {
+  return (await loadManagedLfgs(db, guildId, actor)).length > 0;
 }
 
 async function finishControlOpening(
   env: Env,
   guildId: string,
-  gameId: string,
   actor: string,
   pending: PendingControlSession,
   messageId: string,
@@ -237,10 +193,10 @@ async function finishControlOpening(
 ): Promise<boolean> {
   if (pending.previous && !await deleteStoredControlMessage(pending.previous)) {
     await deleteNew();
-    await cancelControlSessionOpening(env.DB, guildId, gameId, actor, pending.nonce);
+    await cancelControlSessionOpening(env.DB, guildId, actor, pending.nonce);
     return false;
   }
-  const promoted = await promoteControlSession(env.DB, guildId, gameId, actor, pending.nonce, messageId);
+  const promoted = await promoteControlSession(env.DB, guildId, actor, pending.nonce, messageId);
   if (promoted) return true;
   await deleteNew();
   return false;
@@ -250,24 +206,25 @@ async function completeMemberAction(
   env: Env,
   i: DiscordInteraction,
   game: Game,
-  action: "pause" | "resume" | "stop",
+  action: ManagerAction,
 ): Promise<void> {
   const actor = userId(i)!;
   try {
     const result = await mutateGameMembership(env.DB, i.guild_id!, game.id, actor, action);
     const panelProjection = projectGamePanelAfterWrite(env, i.guild_id!, game.id, i.channel_id)
       .catch((error) => console.error("Write-complete LFG panel projection failed", error));
+    const manager = await loadManagedLfgs(env.DB, i.guild_id!, actor);
 
-    if (action === "stop") {
-      const current = await takeControlSession(env.DB, i.guild_id!, game.id, actor);
+    if (!manager.length) {
+      const current = await takeControlSession(env.DB, i.guild_id!, actor);
       const clickedMessageId = i.message?.id;
       if (!await deleteInteractionOriginal(i)) {
-        await editInteractionOriginal(i, memberControlData(game, undefined, undefined, false));
+        await editInteractionOriginal(i, managerData([]));
       }
       if (current && current.messageId !== clickedMessageId) await deleteStoredControlMessage(current);
     } else {
-      await refreshControlSessionToken(env.DB, i.guild_id!, game.id, actor, i.message?.id, i.application_id, i.token);
-      if (!await editInteractionOriginal(i, memberControlData(game, result.member))) {
+      await refreshControlSessionToken(env.DB, i.guild_id!, actor, i.message?.id, i.application_id, i.token);
+      if (!await editInteractionOriginal(i, managerData(manager))) {
         await interactionFollowup(i, "Your LFG state changed, but Discord could not refresh your controls.");
       }
     }
@@ -276,51 +233,66 @@ async function completeMemberAction(
     if (action === "resume") await notifyGroupOverlaps(env, i.channel_id!, actor, [result]);
     if (action === "stop") await collectDeletedCustomGames(env.DB);
   } catch (error) {
-    const group = await loadGameGroup(env.DB, i.guild_id!, game.id);
-    const member = group ? await loadGroupMember(env.DB, group.id, actor) : undefined;
-    await editInteractionOriginal(i, memberControlData(game, member));
+    const manager = await loadManagedLfgs(env.DB, i.guild_id!, actor);
+    await editInteractionOriginal(i, managerData(manager));
     await interactionFollowup(i, error instanceof Error ? error.message : "Could not update your LFG state.");
   }
 }
 
-function memberControlData(
-  game: Game,
-  member?: GroupMember,
-  loadingAction?: "pause" | "resume" | "stop",
+function managerData(
+  managed: ManagedLfg[],
+  loading?: LoadingState,
   showControls = true,
 ): Record<string, unknown> {
-  const state = groupMemberState(member);
-  const status = loadingAction
-    ? `${loadingAction === "pause" ? "Pausing" : loadingAction === "resume" ? "Resuming" : "Stopping"}…`
-    : state === "active" ? `Looking until ${discordTimestamp(new Date(member!.expiresAt))}`
-      : state === "paused" ? `Paused until ${discordTimestamp(new Date(member!.expiresAt))}`
-        : "Not looking";
-  const primary = state === "paused"
-    ? { type: 2, style: 1, label: "▶ Resume", custom_id: `group:resume:${game.id}` }
-    : { type: 2, style: 1, label: "⏸ Pause", custom_id: `group:pause:${game.id}` };
-  const components = showControls && (state === "active" || state === "paused")
-    ? [{
-      type: 1,
-      components: loadingAction === "stop"
-        ? [
-          { ...primary, disabled: true },
-          { type: 2, style: 4, label: "⏳ Stopping…", custom_id: `group:busy:${game.id}`, disabled: true },
-        ]
-        : loadingAction
-          ? [
-            { type: 2, style: 1, label: `⏳ ${status}`, custom_id: `group:busy:${game.id}`, disabled: true },
-            { type: 2, style: 4, label: "■ Stop", custom_id: `group:stop:${game.id}`, disabled: true },
-          ]
-          : [primary, { type: 2, style: 4, label: "■ Stop", custom_id: `group:stop:${game.id}` }],
-    }]
-    : [];
+  const visible = managed.slice(0, MAX_MANAGER_ROWS);
+  const components: Record<string, unknown>[] = [
+    { type: 10, content: "### Your LFGs" },
+  ];
+
+  for (const { game, member } of visible) {
+    const state = groupMemberState(member);
+    const loadingThis = loading?.gameId === game.id;
+    const primaryLabel = state === "paused" ? "▶ Resume" : "⏸ Pause";
+    const primaryAction = state === "paused" ? "resume" : "pause";
+    const status = loadingThis
+      ? loading?.action === "pause" ? "Pausing…"
+        : loading?.action === "resume" ? "Resuming…"
+          : "Stopping…"
+      : state === "paused"
+        ? `Paused until ${discordTimestamp(new Date(member.expiresAt))}`
+        : `Looking until ${discordTimestamp(new Date(member.expiresAt))}`;
+
+    components.push({
+      type: 9,
+      components: [{ type: 10, content: `**${game.name}**` }],
+      accessory: {
+        type: 2,
+        style: 2,
+        label: loadingThis && loading?.action !== "stop" ? `⏳ ${status}` : primaryLabel,
+        custom_id: loadingThis ? `group:busy:${game.id}` : `group:${primaryAction}:${game.id}`,
+        disabled: loadingThis || !showControls,
+      },
+    });
+    components.push({
+      type: 9,
+      components: [{ type: 10, content: `-# ${status}` }],
+      accessory: {
+        type: 2,
+        style: 4,
+        label: loadingThis && loading?.action === "stop" ? "⏳ Stopping…" : "■ Stop",
+        custom_id: loadingThis ? `group:busy:${game.id}` : `group:stop:${game.id}`,
+        disabled: loadingThis || !showControls,
+      },
+    });
+  }
+
+  if (managed.length > visible.length) {
+    components.push({ type: 10, content: `-# Showing ${visible.length} of ${managed.length} LFGs.` });
+  }
+  if (!managed.length) components.push({ type: 10, content: "-# No active LFGs." });
+
   return {
-    embeds: [{
-      title: game.name,
-      description: status,
-      thumbnail: game.coverUrl ? { url: game.coverUrl } : undefined,
-    }],
-    components,
+    components: [{ type: 17, components }],
   };
 }
 
@@ -421,7 +393,7 @@ async function interactionFollowup(i: DiscordInteraction, content: string): Prom
     const response = await fetch(`https://discord.com/api/v10/webhooks/${i.application_id}/${i.token}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ content, flags: 64 }),
+      body: JSON.stringify({ content, flags: EPHEMERAL }),
     });
     if (!response.ok) console.error("Discord interaction followup failed", response.status, await response.text());
   } catch (error) {
@@ -430,5 +402,5 @@ async function interactionFollowup(i: DiscordInteraction, content: string): Prom
 }
 
 function ephemeral(content: string): Response {
-  return json({ type: ResponseType.ChannelMessage, data: { content, flags: 64 } });
+  return json({ type: ResponseType.ChannelMessage, data: { content, flags: EPHEMERAL } });
 }
