@@ -136,16 +136,12 @@ export async function takeControlSession(
   userId: string,
 ): Promise<LfgControlReference | undefined> {
   const row = await db.prepare(`
-    SELECT current_application_id AS applicationId,
-      current_interaction_token AS interactionToken,
-      current_message_id AS messageId
-    FROM lfg_control_sessions
-    WHERE guild_id = ? AND game_id = ? AND user_id = ?
-  `).bind(guildId, gameId, userId).first<LfgControlReference>();
-  await db.prepare(`
     DELETE FROM lfg_control_sessions
     WHERE guild_id = ? AND game_id = ? AND user_id = ?
-  `).bind(guildId, gameId, userId).run();
+    RETURNING current_application_id AS applicationId,
+      current_interaction_token AS interactionToken,
+      current_message_id AS messageId
+  `).bind(guildId, gameId, userId).first<LfgControlReference>();
   return row?.applicationId && row.interactionToken && row.messageId ? row : undefined;
 }
 
