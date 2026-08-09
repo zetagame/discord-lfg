@@ -1,6 +1,8 @@
 import type { Game } from "./types";
 
 const IGDB_BUDGET_MS = 2200;
+const ANY_GAME_NAME = "Any";
+const ANY_GAME_PROVIDER_ID = "system:any";
 
 export interface GameProvider {
   search(query: string): Promise<Game[]>;
@@ -97,7 +99,7 @@ export class GameSelectionService {
 
   async resolve(guildId: string, input: string, createdByUserId?: string): Promise<Game[]> {
     const name = input.trim();
-    if (!name) throw new Error("Choose a game.");
+    if (!name || name.toLowerCase() === ANY_GAME_NAME.toLowerCase()) return [await this.resolveAny(guildId)];
     return [await this.resolveOne(guildId, name, createdByUserId)];
   }
 
@@ -117,6 +119,23 @@ export class GameSelectionService {
     await this.db.prepare("UPDATE games SET deleted_at = ? WHERE id = ? AND guild_id = ?")
       .bind(new Date().toISOString(), gameId, guildId).run();
     return { game, collected: await collectDeletedCustomGame(this.db, gameId) };
+  }
+
+  private async resolveAny(guildId: string): Promise<Game> {
+    await this.db.prepare(`
+      INSERT OR IGNORE INTO games (id, guild_id, name, provider_id, cover_url, created_by_user_id)
+      VALUES (?, ?, ?, ?, NULL, NULL)
+    `).bind(crypto.randomUUID(), guildId, ANY_GAME_NAME, ANY_GAME_PROVIDER_ID).run();
+    await this.db.prepare(`
+      UPDATE games SET provider_id = ?, created_by_user_id = NULL, deleted_at = NULL
+      WHERE guild_id = ? AND name = ? AND (provider_id IS NULL OR provider_id = ?)
+    `).bind(ANY_GAME_PROVIDER_ID, guildId, ANY_GAME_NAME, ANY_GAME_PROVIDER_ID).run();
+    const game = await this.db.prepare(`
+      SELECT id, name, provider_id AS providerId, cover_url AS coverUrl, created_by_user_id AS createdByUserId
+      FROM games WHERE guild_id = ? AND name = ? AND deleted_at IS NULL
+    `).bind(guildId, ANY_GAME_NAME).first<Game>();
+    if (!game) throw new Error("Could not create the Any game pool.");
+    return game;
   }
 
   private async resolveOne(guildId: string, name: string, createdByUserId?: string): Promise<Game> {
