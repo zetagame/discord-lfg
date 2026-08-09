@@ -3,13 +3,15 @@ export interface ActionAfterOptions {
   retries?: number;
 }
 
-const DEFAULT_TIMEOUT_MS = 750;
+const DEFAULT_TIMEOUT_MS = 3000;
 const DEFAULT_RETRIES = 2;
+
+export class PermanentActionError extends Error {}
 
 /**
  * Runs a side effect immediately after a successful write. Each attempt gets
- * its own abort signal and a short deadline; callers should pass the signal to
- * any network request so timed-out attempts cannot keep running in parallel.
+ * its own abort signal and deadline; callers should pass the signal to network
+ * requests so timed-out attempts cannot keep running beside their retries.
  */
 export async function actionAfter<T>(
   label: string,
@@ -19,26 +21,32 @@ export async function actionAfter<T>(
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const retries = options.retries ?? DEFAULT_RETRIES;
   let lastError: unknown;
+  let attempts = 0;
 
   for (let attempt = 1; attempt <= retries + 1; attempt += 1) {
+    attempts = attempt;
     const controller = new AbortController();
+    const timeoutError = new Error(`${label} timed out after ${timeoutMs}ms`);
+    let timedOut = false;
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const deadline = new Promise<never>((_resolve, reject) => {
       timeout = setTimeout(() => {
+        timedOut = true;
         controller.abort();
-        reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+        reject(timeoutError);
       }, timeoutMs);
     });
 
     try {
       return await Promise.race([action(controller.signal, attempt), deadline]);
     } catch (error) {
-      lastError = error;
+      lastError = timedOut ? timeoutError : error;
+      if (error instanceof PermanentActionError) break;
     } finally {
       if (timeout) clearTimeout(timeout);
     }
   }
 
   const detail = lastError instanceof Error ? lastError.message : String(lastError ?? "unknown error");
-  throw new Error(`${label} failed after ${retries + 1} attempts: ${detail}`);
+  throw new Error(`${label} failed after ${attempts} attempts: ${detail}`);
 }
