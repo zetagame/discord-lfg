@@ -2,7 +2,14 @@ import { collectDeletedCustomGames, IgdbProvider, GameSelectionService } from ".
 import { handleGroupComponent, handleLfgCommand, syncGamePanelsForEvent, syncSharedGameGroups } from "./group_runtime";
 import { InteractionType, ResponseType, json, option, userId, verifyDiscordRequest } from "./discord";
 import { canonicalTimeZone, discordTimestamp, effectiveTimeZone, parseWhen } from "./time";
-import { dueDeliveries, fireRsvpTrigger } from "./events";
+import {
+  claimActiveEventDelivery,
+  dueDeliveries,
+  eventIsActive,
+  fireRsvpTrigger,
+  releaseEventDeliveryClaim,
+  type EventDeliveryKind,
+} from "./events";
 import type { DiscordInteraction, Env, Game } from "./types";
 
 const gameOption = { name: "games", description: "Games", type: 3, required: true, autocomplete: true };
@@ -473,22 +480,27 @@ async function deliver(
   env: Env,
   eventId: string,
   userIdValue: string,
-  kind: "reminder" | "start" | "activation",
+  kind: EventDeliveryKind,
   channelId: string,
   content: string,
 ): Promise<void> {
   if (!env.DISCORD_BOT_TOKEN) return;
-  const claimed = await env.DB.prepare("INSERT OR IGNORE INTO event_deliveries (event_id, user_id, kind, delivered_at) VALUES (?, ?, ?, ?)")
-    .bind(eventId, userIdValue, kind, new Date().toISOString()).run();
-  if (!claimed.meta.changes) return;
+  const claimed = await claimActiveEventDelivery(env.DB, eventId, userIdValue, kind);
+  if (!claimed) return;
+
+  // The due-event query and delivery claim can both race an event deletion.
+  // Re-read immediately before the network side effect; if deletion won, drop
+  // the claim so there is no stale reminder/start/activation to retry later.
+  if (!await eventIsActive(env.DB, eventId)) {
+    await releaseEventDeliveryClaim(env.DB, eventId, userIdValue, kind);
+    return;
+  }
+
   const response = await postChannelMessage(env, channelId, {
     content,
     allowed_mentions: userIdValue ? { users: [userIdValue] } : { parse: [] },
   });
-  if (!response?.ok) {
-    await env.DB.prepare("DELETE FROM event_deliveries WHERE event_id = ? AND user_id = ? AND kind = ?")
-      .bind(eventId, userIdValue, kind).run();
-  }
+  if (!response?.ok) await releaseEventDeliveryClaim(env.DB, eventId, userIdValue, kind);
 }
 
 async function postChannelMessage(env: Env, channelId: string, body: Record<string, unknown>): Promise<Response | undefined> {
