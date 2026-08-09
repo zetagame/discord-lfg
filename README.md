@@ -39,11 +39,9 @@ no local Wrangler login.
 
 ## Commands
 
-- `/lfg Games [Duration]` adds or extends your membership in each selected
-  game's shared group. The default duration is two hours.
-- `/create Games When` creates an RSVP event. The creator starts as Yes. One
-  game has only RSVP buttons; multiple games also have a separate game-voting
-  select.
+- `/lfg Game [Duration]` adds or extends your membership in that game's shared
+  group. The default duration is two hours.
+- `/create Game When` creates an RSVP event. The creator starts as Yes.
 
 There is no separate listen/mute state. Your `/lfg` response is ephemeral and
 contains a blue **Pause** button and red **Stop** button for your membership.
@@ -72,12 +70,18 @@ When a user newly joins or resumes into overlap with existing active members,
 the bot sends one deduplicated mention notification for the new overlap. Pair
 claims in D1 prevent concurrent requests from double-notifying the same overlap.
 
+Membership writes atomically increment a durable public-panel revision. After
+the write commits, the Worker immediately projects that revision to Discord with
+a three-second attempt deadline and two retries. Panel creation reuses a stable
+Discord nonce with `enforce_nonce` so retrying an accepted-but-timed-out POST does
+not create a second public message. The five-minute scheduled Worker tick is only
+a reconciliation fallback for dirty or expired groups.
+
 A game's public panel exists while at least one LFG member is active. It also
 appears during the hour before a scheduled event for that game. The current
 event model has no capacity field, so scheduled events are treated as open for
 this panel-lifecycle rule. Once neither condition applies, the Worker removes
-the public panel. The five-minute scheduled Worker tick handles expiries and
-panel lifecycle as a fallback.
+the public panel.
 
 The shared public panel has **Manage my LFG**, which opens personalized ephemeral
 controls. This keeps Pause/Resume state personal even though Discord message
