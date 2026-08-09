@@ -109,7 +109,7 @@ async function withAckBudget(
   if (timer) clearTimeout(timer);
 
   if (fast) {
-    if (fast.response) return fast.response;
+    if ("response" in fast) return fast.response;
     console.error("Discord interaction failed before acknowledgement", fast.error);
     return Response.json({
       type: ResponseType.ChannelMessage,
@@ -132,7 +132,7 @@ async function finalizeDeferred(
   spec: DeferredSpec,
 ): Promise<void> {
   const result = await settled;
-  if (result.error) {
+  if ("error" in result) {
     console.error("Discord interaction failed after deferred acknowledgement", result.error);
     await finishDeferredError(interaction, spec);
     return;
