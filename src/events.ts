@@ -8,12 +8,8 @@ export function dueDeliveries(startsAt: Date, status: RsvpStatus, now: Date): Ev
 }
 
 export async function fireRsvpTrigger(db: D1Database, eventId: string, now = new Date()): Promise<boolean> {
-  const trigger = await db.prepare(`
-    SELECT event_triggers.type, event_triggers.threshold, event_triggers.fired_at
-    FROM event_triggers
-    JOIN events ON events.id = event_triggers.event_id
-    WHERE event_triggers.event_id = ? AND events.deleted_at IS NULL
-  `).bind(eventId).first<{ type: string; threshold: number; fired_at?: string }>();
+  const trigger = await db.prepare("SELECT type, threshold, fired_at FROM event_triggers WHERE event_id = ?").bind(eventId)
+    .first<{ type: string; threshold: number; fired_at?: string }>();
   if (!trigger || trigger.fired_at || !["yes_rsvps", "yes-or-maybe_rsvps"].includes(trigger.type)) return false;
   const statuses = trigger.type === "yes_rsvps" ? ["yes"] : ["yes", "maybe"];
   const count = await db.prepare(`SELECT COUNT(*) AS count FROM rsvps WHERE event_id = ? AND status IN (${statuses.map(() => "?").join(",")})`)
