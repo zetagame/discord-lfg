@@ -124,6 +124,11 @@ async function finalizeOriginalControl(
     await cancelControlSessionOpening(env.DB, i.guild_id, gameId, actor, pending.nonce);
     return;
   }
+  if (!await controlStillValid(env.DB, i.guild_id, gameId, actor)) {
+    await deleteOriginalWebhookMessage(i.application_id, i.token);
+    await cancelControlSessionOpening(env.DB, i.guild_id, gameId, actor, pending.nonce);
+    return;
+  }
   await finishControlOpening(
     env,
     i.guild_id,
@@ -139,7 +144,7 @@ async function sendTrackedControlFollowup(
   env: Env,
   i: DiscordInteraction,
   game: Game,
-  member: GroupMember,
+  member: GroupMember | undefined,
   actor: string,
 ): Promise<void> {
   if (!i.application_id || !i.guild_id) return;
@@ -159,7 +164,8 @@ async function sendTrackedControlFollowup(
       return;
     }
     messageId = (await response.json() as { id?: string }).id;
-    if (!messageId) {
+    if (!messageId || !await controlStillValid(env.DB, i.guild_id, game.id, actor)) {
+      if (messageId) await deleteWebhookMessage(i.application_id, i.token, messageId);
       await cancelControlSessionOpening(env.DB, i.guild_id, game.id, actor, pending.nonce);
       return;
     }
@@ -177,6 +183,14 @@ async function sendTrackedControlFollowup(
     if (messageId) await deleteWebhookMessage(i.application_id, i.token, messageId);
     await cancelControlSessionOpening(env.DB, i.guild_id, game.id, actor, pending.nonce);
   }
+}
+
+async function controlStillValid(db: D1Database, guildId: string, gameId: string, actor: string): Promise<boolean> {
+  const group = await loadGameGroup(db, guildId, gameId);
+  if (!group) return false;
+  const member = await loadGroupMember(db, group.id, actor);
+  const state = groupMemberState(member);
+  return state === "active" || state === "paused";
 }
 
 async function finishControlOpening(
