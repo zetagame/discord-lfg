@@ -45,6 +45,32 @@ export function parseDuration(input: string | undefined, timeZone = DEFAULT_TIME
 export function parseWhen(input: string, timeZone: string, now = new Date()): Date | undefined {
   const value = input.trim().toLowerCase();
   if (value.startsWith("until ")) return parseUntil(value.slice(6).trim(), timeZone, now);
+
+  const daypart = /^(today|tomorrow)\s+(morning|afternoon|evening|night)$/.exec(value);
+  if (daypart) {
+    const local = localParts(now, timeZone);
+    const dayOffset = daypart[1] === "tomorrow" ? 1 : 0;
+    const hour = { morning: 9, afternoon: 15, evening: 19, night: 20 }[daypart[2]!]!;
+    return zonedUtc(local.year, local.month, local.day + dayOffset, hour, 0, timeZone);
+  }
+
+  const relativeClock = /^(today|tomorrow)(?:\s+at)?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)$/.exec(value);
+  if (relativeClock) {
+    const local = localParts(now, timeZone);
+    let hour = Number(relativeClock[2]);
+    if (hour < 1 || hour > 12) return undefined;
+    if (relativeClock[4] === "pm" && hour < 12) hour += 12;
+    if (relativeClock[4] === "am" && hour === 12) hour = 0;
+    return zonedUtc(
+      local.year,
+      local.month,
+      local.day + (relativeClock[1] === "tomorrow" ? 1 : 0),
+      hour,
+      Number(relativeClock[3] ?? 0),
+      timeZone,
+    );
+  }
+
   const date = /^\d{4}-\d{2}-\d{2}[ t](\d{1,2})(?::(\d{2}))?$/.exec(value);
   if (date) {
     const [year, month, day] = value.slice(0, 10).split("-").map(Number);
