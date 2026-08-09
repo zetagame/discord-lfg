@@ -158,7 +158,7 @@ async function hasActiveEvent(db: D1Database, gameId: string): Promise<boolean> 
     FROM event_games
     JOIN events ON events.id = event_games.event_id
     LEFT JOIN event_triggers ON event_triggers.event_id = events.id
-    WHERE event_games.game_id = ? AND (
+    WHERE event_games.game_id = ? AND events.deleted_at IS NULL AND (
       (events.starts_at IS NOT NULL AND julianday(events.starts_at) > julianday('now'))
       OR (events.starts_at IS NULL AND (event_triggers.fired_at IS NULL OR event_triggers.event_id IS NULL))
     )
@@ -181,12 +181,14 @@ export async function collectDeletedCustomGame(db: D1Database, gameId: string): 
     db.prepare("DELETE FROM lfg_games WHERE game_id = ?").bind(gameId),
     db.prepare(`DELETE FROM event_game_votes WHERE game_id = ? AND event_id IN (
       SELECT events.id FROM events LEFT JOIN event_triggers ON event_triggers.event_id = events.id
-      WHERE (events.starts_at IS NOT NULL AND julianday(events.starts_at) <= julianday('now'))
+      WHERE events.deleted_at IS NOT NULL
+        OR (events.starts_at IS NOT NULL AND julianday(events.starts_at) <= julianday('now'))
         OR (events.starts_at IS NULL AND event_triggers.fired_at IS NOT NULL)
     )`).bind(gameId),
     db.prepare(`DELETE FROM event_games WHERE game_id = ? AND event_id IN (
       SELECT events.id FROM events LEFT JOIN event_triggers ON event_triggers.event_id = events.id
-      WHERE (events.starts_at IS NOT NULL AND julianday(events.starts_at) <= julianday('now'))
+      WHERE events.deleted_at IS NOT NULL
+        OR (events.starts_at IS NOT NULL AND julianday(events.starts_at) <= julianday('now'))
         OR (events.starts_at IS NULL AND event_triggers.fired_at IS NOT NULL)
     )`).bind(gameId),
     db.prepare("DELETE FROM game_groups WHERE game_id = ?").bind(gameId),
