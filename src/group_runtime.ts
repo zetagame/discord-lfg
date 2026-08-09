@@ -51,16 +51,16 @@ export async function handleLfgCommand(
   }
   if (!updates.length) return ephemeral("Choose at least one game.");
 
-  // The D1 membership write has committed at this point. Start the public
-  // projection immediately and independently from private control bookkeeping.
-  for (const update of updates) {
-    ctx.waitUntil(projectGamePanelAfterWrite(
-      env,
-      update.snapshot.group.guildId,
-      update.snapshot.game.id,
-      i.channel_id,
-    ).catch((error) => console.error("Write-complete LFG panel projection failed", error)));
-  }
+  // The membership write is durable before Discord projection starts. Await the
+  // public projection here so a newly-created/updated group panel is ordered
+  // before the private manager response. Discord retries remain isolated inside
+  // the projector and never replay the D1 write.
+  await Promise.all(updates.map((update) => projectGamePanelAfterWrite(
+    env,
+    update.snapshot.group.guildId,
+    update.snapshot.game.id,
+    i.channel_id,
+  ).catch((error) => console.error("Write-complete LFG panel projection failed", error))));
 
   const manager = await loadManagedLfgs(env.DB, i.guild_id!, actor);
   const session = i.application_id
