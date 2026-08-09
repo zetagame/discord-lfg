@@ -4,19 +4,33 @@ import { InteractionType, ResponseType, json, option, userId, verifyDiscordReque
 import { canonicalTimeZone, discordTimestamp, effectiveTimeZone, parseWhen } from "./time";
 import {
   claimActiveEventDelivery,
+  claimMinimumPlayerCheck,
   dueDeliveries,
   eventIsActive,
   fireRsvpTrigger,
+  markMinimumPlayerAlerted,
+  parseRsvpTrigger,
   releaseEventDeliveryClaim,
+  releaseMinimumPlayerCheck,
   type EventDeliveryKind,
 } from "./events";
 import type { DiscordInteraction, Env, Game } from "./types";
 
 const gameOption = { name: "games", description: "Games", type: 3, required: true, autocomplete: true };
 const durationOption = { name: "duration", description: "Duration", type: 3 };
+const minPlayersOption = {
+  name: "min_players",
+  description: "Alert 30m before if fewer Yes RSVPs are confirmed",
+  type: 4,
+  min_value: 1,
+};
 const commands = [
   { name: "lfg", description: "Look for people to play with", options: [gameOption, durationOption] },
-  { name: "create", description: "Create a game event", options: [gameOption, { name: "when", description: "When", type: 3, required: true }] },
+  {
+    name: "create",
+    description: "Create a game event",
+    options: [gameOption, { name: "when", description: "When", type: 3, required: true }, minPlayersOption],
+  },
 ];
 
 let cachedIgdb: { clientId?: string; clientSecret?: string; provider: IgdbProvider } | undefined;
@@ -117,15 +131,27 @@ async function createEvent(i: DiscordInteraction, env: Env, games: Game[], actor
   const userZone = await userTimeZone(env.DB, i.guild_id!, actor);
   const whenInput = String(option(i, "when") ?? "");
   const startsAt = parseWhen(whenInput, userZone.timeZone);
-  const trigger = parseTrigger(whenInput);
-  if (!startsAt && !trigger) return message("Use a scheduled date/time, or a trigger such as \"3 yes RSVPs\".", true);
+  const trigger = parseRsvpTrigger(whenInput);
+  const minPlayersValue = option(i, "min_players");
+  const minPlayers = minPlayersValue === undefined ? undefined : Number(minPlayersValue);
+
+  if (!startsAt && !trigger) {
+    return message("Use a scheduled time such as \"tomorrow night\", or an RSVP trigger such as \"3 yes RSVPs\".", true);
+  }
+  if (startsAt && startsAt.getTime() <= Date.now()) return message("Choose a future event time.", true);
+  if (minPlayers !== undefined && (!Number.isInteger(minPlayers) || minPlayers < 1)) {
+    return message("Min players must be a positive whole number.", true);
+  }
+  if (minPlayers !== undefined && !startsAt) {
+    return message("Min players requires a scheduled event time so the 30-minute check has a start time.", true);
+  }
   if (userZone.shouldPrompt) await markTimezonePrompted(env.DB, i.guild_id!, actor);
 
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
   await env.DB.batch([
-    env.DB.prepare("INSERT INTO events (id, guild_id, channel_id, author_id, title, starts_at, when_input) VALUES (?, ?, ?, ?, ?, ?, ?)")
-      .bind(id, i.guild_id, i.channel_id, actor, "Game night", startsAt?.toISOString() ?? null, whenInput),
+    env.DB.prepare("INSERT INTO events (id, guild_id, channel_id, author_id, title, starts_at, when_input, min_players) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .bind(id, i.guild_id, i.channel_id, actor, "Game night", startsAt?.toISOString() ?? null, whenInput, minPlayers ?? null),
     ...games.map((game) => env.DB.prepare("INSERT INTO event_games (event_id, game_id) VALUES (?, ?)").bind(id, game.id)),
     env.DB.prepare("INSERT INTO rsvps (event_id, user_id, status, updated_at) VALUES (?, ?, 'yes', ?)").bind(id, actor, now),
     ...(trigger ? [env.DB.prepare("INSERT INTO event_triggers (event_id, type, threshold) VALUES (?, ?, ?)").bind(id, trigger.type, trigger.threshold)] : []),
@@ -143,8 +169,8 @@ async function eventMessageData(
   guildId: string,
   deleting = false,
 ): Promise<Record<string, unknown>> {
-  const event = await db.prepare("SELECT id, title, starts_at, when_input FROM events WHERE id = ? AND guild_id = ? AND deleted_at IS NULL")
-    .bind(eventId, guildId).first<{ id: string; title: string; starts_at?: string; when_input?: string }>();
+  const event = await db.prepare("SELECT id, title, starts_at, when_input, min_players FROM events WHERE id = ? AND guild_id = ? AND deleted_at IS NULL")
+    .bind(eventId, guildId).first<{ id: string; title: string; starts_at?: string; when_input?: string; min_players?: number }>();
   if (!event) throw new Error("Event not found.");
 
   const games = await db.prepare(`
@@ -171,6 +197,7 @@ async function eventMessageData(
       fields: [
         { name: "Games", value: gameNames(games.results), inline: false },
         { name: "When", value: when, inline: false },
+        ...(event.min_players ? [{ name: "Min players", value: `${event.min_players} Yes RSVPs`, inline: false }] : []),
         { name: `Yes (${rsvps.results.filter((rsvp) => rsvp.status === "yes").length})`, value: byStatus("yes"), inline: false },
         { name: `Maybe (${rsvps.results.filter((rsvp) => rsvp.status === "maybe").length})`, value: byStatus("maybe"), inline: false },
         { name: `No (${rsvps.results.filter((rsvp) => rsvp.status === "no").length})`, value: byStatus("no"), inline: false },
@@ -430,11 +457,6 @@ async function markTimezonePrompted(db: D1Database, guildId: string, userIdValue
   ).bind(guildId, userIdValue, new Date().toISOString()).run();
 }
 
-function parseTrigger(value: string): { type: string; threshold: number } | undefined {
-  const match = /^(\d+)\s+(people online|yes rsvps|yes-or-maybe rsvps)$/i.exec(value.trim());
-  return match ? { threshold: Number(match[1]), type: match[2].toLowerCase().replaceAll(" ", "_") } : undefined;
-}
-
 async function sendScheduledNotifications(env: Env, now = new Date()): Promise<void> {
   const events = await env.DB.prepare(`
     SELECT events.id, events.channel_id, events.title, events.starts_at, rsvps.user_id, rsvps.status
@@ -456,6 +478,44 @@ async function sendScheduledNotifications(env: Env, now = new Date()): Promise<v
       await deliver(env, event.id, event.user_id, kind, event.channel_id, content);
     }
   }
+
+  const minimums = await env.DB.prepare(`
+    SELECT id, channel_id, author_id, title, min_players
+    FROM events
+    WHERE deleted_at IS NULL
+      AND starts_at IS NOT NULL
+      AND min_players IS NOT NULL
+      AND julianday(starts_at) > julianday(?)
+      AND julianday(starts_at) <= julianday(?, '+30 minutes')
+  `).bind(now.toISOString(), now.toISOString()).all<{
+    id: string;
+    channel_id: string;
+    author_id: string;
+    title: string;
+    min_players: number;
+  }>();
+  for (const event of minimums.results) await checkMinimumPlayers(env, event, now);
+}
+
+async function checkMinimumPlayers(
+  env: Env,
+  event: { id: string; channel_id: string; author_id: string; title: string; min_players: number },
+  now: Date,
+): Promise<void> {
+  const yesCount = await claimMinimumPlayerCheck(env.DB, event.id, now);
+  if (yesCount === undefined) return;
+  if (yesCount >= event.min_players) return;
+  if (!await eventIsActive(env.DB, event.id)) {
+    await releaseMinimumPlayerCheck(env.DB, event.id);
+    return;
+  }
+
+  const response = await postChannelMessage(env, event.channel_id, {
+    content: `<@${event.author_id}> **${event.title}** has ${yesCount}/${event.min_players} confirmed players and starts in about 30 minutes.`,
+    allowed_mentions: { users: [event.author_id] },
+  });
+  if (response?.ok) await markMinimumPlayerAlerted(env.DB, event.id, now);
+  else await releaseMinimumPlayerCheck(env.DB, event.id);
 }
 
 async function onEventActivated(env: Env, eventId: string): Promise<void> {
