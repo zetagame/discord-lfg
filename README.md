@@ -26,6 +26,18 @@ Interactions over HTTP; it does not require a Gateway connection.
 `npm run typecheck` is an alias for the type check. For a remote D1 database,
 use `npx wrangler d1 migrations apply discord-lfg --remote`.
 
+## Continuous integration and deployment
+
+Pull requests to `main` automatically run `npm run check` and `npm test`.
+Merges to `main` automatically apply remote D1 migrations, then deploy the
+Worker. The deployment can also be manually rerun with the GitHub Actions
+`workflow_dispatch` trigger.
+
+Set `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` as GitHub Actions
+secrets. Set `DISCORD_PUBLIC_KEY`, `DISCORD_BOT_TOKEN`, `IGDB_CLIENT_ID`, and
+`IGDB_CLIENT_SECRET` as Cloudflare Worker secrets. Routine deployments require
+no local Wrangler login.
+
 ## Commands
 
 - `/listen Games [Duration]` appends a listening instruction.

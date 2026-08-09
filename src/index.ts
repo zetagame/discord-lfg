@@ -28,7 +28,6 @@ const timezoneOptions = [
   { label: "Central (Chicago)", value: "America/Chicago" },
   { label: "Mountain (Denver)", value: "America/Denver" },
   { label: "Pacific (Los Angeles)", value: "America/Los_Angeles" },
-  { label: "Other (enter manually)", value: "other" },
   { label: "Skip (keep America/New_York)", value: "skip" },
 ];
 
