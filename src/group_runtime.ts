@@ -20,6 +20,7 @@ import {
   type GroupMember,
   type MembershipUpdate,
 } from "./lfg";
+import { reconcileLegacyLfgs } from "./legacy_lfg";
 import { ResponseType, json, userId } from "./discord";
 import { discordTimestamp } from "./time";
 import type { DiscordInteraction, Env, Game } from "./types";
@@ -34,6 +35,7 @@ export async function handleLfgCommand(
   expiresAt: Date,
   ctx: ExecutionContext,
 ): Promise<Response> {
+  await reconcileLegacyLfgs(env.DB);
   const updates: MembershipUpdate[] = [];
   for (const game of games) {
     updates.push(await upsertGameMembership(env.DB, i.guild_id!, i.channel_id!, actor, game, expiresAt));
@@ -61,6 +63,7 @@ export async function handleGroupComponent(i: DiscordInteraction, env: Env, ctx:
   const actor = userId(i);
   if (!i.guild_id || !actor || !gameId || !action || action === "busy") return ephemeral("This group action is not available.");
 
+  await reconcileLegacyLfgs(env.DB);
   const group = await loadGameGroup(env.DB, i.guild_id, gameId);
   const snapshot = await loadGameGroupSnapshot(env.DB, i.guild_id, gameId);
   if (!group || !snapshot) return ephemeral("That game group no longer exists.");
@@ -171,7 +174,7 @@ function gamePanelData(snapshot: GameGroupSnapshot): Record<string, unknown> {
 }
 
 function panelEligible(snapshot: GameGroupSnapshot): boolean {
-  return !snapshot.game.deletedAt && (snapshot.activeUserIds.length > 0 || Boolean(snapshot.upcomingEvent));
+  return snapshot.activeUserIds.length > 0 || Boolean(snapshot.upcomingEvent);
 }
 
 export async function syncGamePanel(env: Env, guildId: string, gameId: string, preferredChannelId?: string): Promise<void> {
@@ -234,6 +237,7 @@ export async function syncGamePanel(env: Env, guildId: string, gameId: string, p
 }
 
 export async function syncSharedGameGroups(env: Env): Promise<void> {
+  await reconcileLegacyLfgs(env.DB);
   await pruneExpiredGroupMembers(env.DB);
   await ensureGroupsForUpcomingEvents(env.DB);
   await retireLegacyLfgCards(env);
