@@ -1,5 +1,14 @@
 import { collectDeletedCustomGames } from "./games";
 import {
+  beginControlSession,
+  clearControlSession,
+  finalizeControlSession,
+  pruneControlSessions,
+  type LfgControlSession,
+  type PendingControlSession,
+} from "./control_sessions";
+import { lfgMemberLines } from "./discord_presence";
+import {
   claimPanelCreation,
   clearPanelMessage,
   ensureGameGroup,
@@ -72,6 +81,9 @@ export async function handleGroupComponent(i: DiscordInteraction, env: Env, ctx:
 
   if (action === "manage") {
     if (state === "missing" || state === "expired") return ephemeral(`You're not currently in **${snapshot.game.name}**. Use /lfg to join or extend the group.`);
+    if (!i.application_id) return ephemeral("Could not open your LFG controls.");
+    const session = await beginControlSession(env.DB, i.guild_id, gameId, actor, i.application_id, i.token);
+    ctx.waitUntil(finalizeManagePanel(env, i, gameId, actor, session));
     return json({ type: ResponseType.ChannelMessage, data: { ...memberControlData(snapshot.game, member), flags: 64 } });
   }
 
@@ -81,6 +93,24 @@ export async function handleGroupComponent(i: DiscordInteraction, env: Env, ctx:
 
   ctx.waitUntil(completeMemberAction(env, i, snapshot.game, action));
   return json({ type: ResponseType.UpdateMessage, data: memberControlData(snapshot.game, member, action) });
+}
+
+async function finalizeManagePanel(
+  env: Env,
+  i: DiscordInteraction,
+  gameId: string,
+  actor: string,
+  pending: PendingControlSession,
+): Promise<void> {
+  if (!i.application_id || !i.guild_id) return;
+  const messageId = await interactionOriginalMessageId(i.application_id, i.token);
+  if (!messageId) return;
+  const current = await finalizeControlSession(env.DB, i.guild_id, gameId, actor, pending.nonce, messageId);
+  if (!current) {
+    await deleteWebhookMessage(i.application_id, i.token, messageId);
+    return;
+  }
+  if (pending.previous?.messageId) await deleteStoredControlMessage(pending.previous);
 }
 
 async function completeMemberAction(
@@ -96,6 +126,7 @@ async function completeMemberAction(
       if (!await deleteInteractionOriginal(i)) {
         await editInteractionOriginal(i, memberControlData(game, undefined));
       }
+      await clearControlSession(env.DB, i.guild_id!, game.id, actor, i.message?.id);
     } else if (!await editInteractionOriginal(i, memberControlData(game, result.member))) {
       await interactionFollowup(i, "Your LFG state changed, but Discord could not refresh your controls.");
     }
@@ -150,8 +181,12 @@ function memberControlData(
   };
 }
 
-function gamePanelData(snapshot: GameGroupSnapshot): Record<string, unknown> {
+async function gamePanelData(env: Env, snapshot: GameGroupSnapshot): Promise<Record<string, unknown>> {
   const fields: Array<Record<string, unknown>> = [];
+  const members = await lfgMemberLines(env, snapshot.group.guildId, snapshot.activeUserIds);
+  if (members.length) {
+    fields.push({ name: "In group", value: embedValue(members.join("\n")), inline: false });
+  }
   if (snapshot.upcomingEvent) {
     fields.push({
       name: "Upcoming event",
@@ -171,6 +206,10 @@ function gamePanelData(snapshot: GameGroupSnapshot): Record<string, unknown> {
       components: [{ type: 2, style: 2, label: "Manage my LFG", custom_id: `group:manage:${snapshot.game.id}` }],
     }],
   };
+}
+
+function embedValue(value: string): string {
+  return value.length <= 1024 ? value : `${value.slice(0, 1021)}…`;
 }
 
 function panelEligible(snapshot: GameGroupSnapshot): boolean {
@@ -207,7 +246,7 @@ export async function syncGamePanel(env: Env, guildId: string, gameId: string, p
   if (!panelChannel) return;
 
   if (snapshot.group.discordMessageId && snapshot.group.channelId) {
-    const edit = await editChannelMessage(env, snapshot.group.channelId, snapshot.group.discordMessageId, gamePanelData(snapshot));
+    const edit = await editChannelMessage(env, snapshot.group.channelId, snapshot.group.discordMessageId, await gamePanelData(env, snapshot));
     if (edit === "updated") return;
     if (edit === "retry") return;
     await clearPanelMessage(env.DB, snapshot.group.id, snapshot.group.discordMessageId);
@@ -218,7 +257,7 @@ export async function syncGamePanel(env: Env, guildId: string, gameId: string, p
   if (!await claimPanelCreation(env.DB, snapshot.group.id, panelChannel, claim)) return;
   let createdMessageId: string | undefined;
   try {
-    const response = await postChannelMessage(env, panelChannel, gamePanelData(snapshot));
+    const response = await postChannelMessage(env, panelChannel, await gamePanelData(env, snapshot));
     if (!response?.ok) return;
     const body = await response.json() as { id?: string };
     if (!body.id) return;
@@ -239,6 +278,7 @@ export async function syncGamePanel(env: Env, guildId: string, gameId: string, p
 export async function syncSharedGameGroups(env: Env): Promise<void> {
   await reconcileLegacyLfgs(env.DB);
   await pruneExpiredGroupMembers(env.DB);
+  await pruneControlSessions(env.DB);
   await ensureGroupsForUpcomingEvents(env.DB);
   await retireLegacyLfgCards(env);
   const groups = await listGameGroups(env.DB);
@@ -330,6 +370,36 @@ async function deleteChannelMessage(env: Env, channelId: string, messageId: stri
     return response.ok || response.status === 404;
   } catch (error) {
     console.error("Discord group panel delete request failed", error);
+    return false;
+  }
+}
+
+async function interactionOriginalMessageId(applicationId: string, token: string): Promise<string | undefined> {
+  try {
+    const response = await fetch(`https://discord.com/api/v10/webhooks/${applicationId}/${token}/messages/@original`);
+    if (!response.ok) {
+      console.error("Discord interaction message lookup failed", response.status, await response.text());
+      return undefined;
+    }
+    return (await response.json() as { id?: string }).id;
+  } catch (error) {
+    console.error("Discord interaction message lookup request failed", error);
+    return undefined;
+  }
+}
+
+async function deleteStoredControlMessage(session: LfgControlSession): Promise<void> {
+  if (!session.messageId) return;
+  await deleteWebhookMessage(session.applicationId, session.interactionToken, session.messageId);
+}
+
+async function deleteWebhookMessage(applicationId: string, token: string, messageId: string): Promise<boolean> {
+  try {
+    const response = await fetch(`https://discord.com/api/v10/webhooks/${applicationId}/${token}/messages/${messageId}`, { method: "DELETE" });
+    if (!response.ok && response.status !== 404) console.error("Discord control message delete failed", response.status, await response.text());
+    return response.ok || response.status === 404;
+  } catch (error) {
+    console.error("Discord control message delete request failed", error);
     return false;
   }
 }
