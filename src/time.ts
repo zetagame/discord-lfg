@@ -10,7 +10,7 @@ export function effectiveTimeZone(timeZone?: string | null): string {
   }
 }
 
-export function parseDuration(input: string | undefined, now = new Date()): Date | undefined {
+export function parseDuration(input: string | undefined, timeZone = DEFAULT_TIME_ZONE, now = new Date()): Date | undefined {
   const value = input?.trim().toLowerCase();
   if (!value) return undefined;
   const relative = /^(\d+)\s*(m|h|d)$/.exec(value);
@@ -18,14 +18,21 @@ export function parseDuration(input: string | undefined, now = new Date()): Date
     const amount = Number(relative[1]);
     return new Date(now.getTime() + amount * ({ m: 60_000, h: 3_600_000, d: 86_400_000 }[relative[2]!]!));
   }
-  if (value === "today") return endOfDay(now);
-  if (value === "tonight") return localAt(now, 21, 0);
-  if (value === "tomorrow") return addDays(endOfDay(now), 1);
+  if (value === "today") return localEndOfDay(now, timeZone);
+  if (value === "tonight") {
+    const local = localParts(now, timeZone);
+    const tonight = zonedUtc(local.year, local.month, local.day, 21, 0, timeZone);
+    return tonight > now ? tonight : zonedUtc(local.year, local.month, local.day + 1, 21, 0, timeZone);
+  }
+  if (value === "tomorrow") {
+    const local = localParts(now, timeZone);
+    return zonedUtc(local.year, local.month, local.day + 1, 23, 59, timeZone, 999);
+  }
   if (value === "this weekend") {
-    const result = new Date(now);
-    result.setDate(result.getDate() + ((6 - result.getDay() + 7) % 7 || 7));
-    result.setHours(23, 59, 59, 999);
-    return result;
+    const local = localParts(now, timeZone);
+    const localDate = new Date(Date.UTC(local.year, local.month - 1, local.day));
+    const days = (6 - localDate.getUTCDay() + 7) % 7;
+    return zonedUtc(local.year, local.month, local.day + days, 23, 59, timeZone, 999);
   }
   return undefined;
 }
@@ -38,7 +45,7 @@ export function parseWhen(input: string, timeZone: string, now = new Date()): Da
     const [year, month, day] = value.slice(0, 10).split("-").map(Number);
     return zonedUtc(year!, month!, day!, Number(date[1] ?? 19), Number(date[2] ?? 0), timeZone);
   }
-  return parseDuration(value, now);
+  return parseDuration(value, timeZone, now);
 }
 
 function parseUntil(value: string, timeZone: string, now: Date): Date | undefined {
@@ -67,16 +74,17 @@ function localParts(date: Date, timeZone: string) {
   return { year: get("year"), month: get("month"), day: get("day") };
 }
 
-function zonedUtc(year: number, month: number, day: number, hour: number, minute: number, timeZone: string): Date {
-  let timestamp = Date.UTC(year, month - 1, day, hour, minute);
+function zonedUtc(year: number, month: number, day: number, hour: number, minute: number, timeZone: string, milliseconds = 0): Date {
+  let timestamp = Date.UTC(year, month - 1, day, hour, minute, milliseconds);
   for (let i = 0; i < 2; i++) {
     const parts = new Intl.DateTimeFormat("en-US", { timeZone, year: "numeric", month: "numeric", day: "numeric", hour: "numeric", hourCycle: "h23", minute: "numeric" }).formatToParts(new Date(timestamp));
     const get = (type: string) => Number(parts.find((part) => part.type === type)?.value);
-    timestamp += Date.UTC(year, month - 1, day, hour, minute) - Date.UTC(get("year"), get("month") - 1, get("day"), get("hour"), get("minute"));
+    timestamp += Date.UTC(year, month - 1, day, hour, minute, milliseconds) - Date.UTC(get("year"), get("month") - 1, get("day"), get("hour"), get("minute"));
   }
   return new Date(timestamp);
 }
 
-function endOfDay(value: Date): Date { const result = new Date(value); result.setHours(23, 59, 59, 999); return result; }
-function localAt(value: Date, hour: number, minute: number): Date { const result = new Date(value); result.setHours(hour, minute, 0, 0); return result; }
-function addDays(value: Date, days: number): Date { const result = new Date(value); result.setDate(result.getDate() + days); return result; }
+function localEndOfDay(value: Date, timeZone: string): Date {
+  const local = localParts(value, timeZone);
+  return zonedUtc(local.year, local.month, local.day, 23, 59, timeZone, 999);
+}
