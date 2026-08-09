@@ -1,5 +1,7 @@
 import type { Game } from "./types";
 
+const ANY_GAME_PROVIDER_ID = "system:any";
+
 export type GroupMemberState = "active" | "paused" | "expired" | "missing";
 
 export interface GameGroup {
@@ -126,14 +128,22 @@ export async function activeUsersByGame(
   if (!gameIds.length) return result;
   const placeholders = gameIds.map(() => "?").join(",");
   const rows = await db.prepare(`
-    SELECT game_groups.game_id AS gameId, group_members.user_id AS userId
-    FROM game_groups
-    JOIN group_members ON group_members.group_id = game_groups.id
-    WHERE game_groups.guild_id = ? AND game_groups.game_id IN (${placeholders})
+    SELECT target.game_id AS gameId, group_members.user_id AS userId
+    FROM game_groups AS target
+    JOIN game_groups AS source ON source.guild_id = target.guild_id
+      AND (
+        source.game_id = target.game_id
+        OR EXISTS (
+          SELECT 1 FROM games AS source_game
+          WHERE source_game.id = source.game_id AND source_game.provider_id = ?
+        )
+      )
+    JOIN group_members ON group_members.group_id = source.id
+    WHERE target.guild_id = ? AND target.game_id IN (${placeholders})
       AND group_members.paused_at IS NULL
       AND julianday(group_members.expires_at) > julianday('now')
-    GROUP BY game_groups.game_id, group_members.user_id
-  `).bind(guildId, ...gameIds).all<{ gameId: string; userId: string }>();
+    GROUP BY target.game_id, group_members.user_id
+  `).bind(ANY_GAME_PROVIDER_ID, guildId, ...gameIds).all<{ gameId: string; userId: string }>();
   for (const row of rows.results) {
     const users = result.get(row.gameId) ?? [];
     users.push(row.userId);
@@ -165,26 +175,40 @@ async function pruneInactiveOverlapPairs(db: D1Database, guildId: string, gameId
   const placeholders = gameIds.map(() => "?").join(",");
   await db.prepare(`
     DELETE FROM lfg_overlap_pairs
-    WHERE guild_id = ? AND game_id IN (${placeholders}) AND (
-      NOT EXISTS (
-        SELECT 1 FROM game_groups
-        JOIN group_members ON group_members.group_id = game_groups.id
-        WHERE game_groups.guild_id = lfg_overlap_pairs.guild_id
-          AND game_groups.game_id = lfg_overlap_pairs.game_id
-          AND group_members.user_id = lfg_overlap_pairs.user_a
-          AND group_members.paused_at IS NULL
-          AND julianday(group_members.expires_at) > julianday('now')
-      ) OR NOT EXISTS (
-        SELECT 1 FROM game_groups
-        JOIN group_members ON group_members.group_id = game_groups.id
-        WHERE game_groups.guild_id = lfg_overlap_pairs.guild_id
-          AND game_groups.game_id = lfg_overlap_pairs.game_id
-          AND group_members.user_id = lfg_overlap_pairs.user_b
-          AND group_members.paused_at IS NULL
-          AND julianday(group_members.expires_at) > julianday('now')
+    WHERE guild_id = ?
+      AND (
+        game_id IN (${placeholders})
+        OR EXISTS (SELECT 1 FROM games WHERE id IN (${placeholders}) AND provider_id = ?)
       )
-    )
-  `).bind(guildId, ...gameIds).run();
+      AND (
+        NOT EXISTS (
+          SELECT 1 FROM game_groups
+          JOIN games ON games.id = game_groups.game_id
+          JOIN group_members ON group_members.group_id = game_groups.id
+          WHERE game_groups.guild_id = lfg_overlap_pairs.guild_id
+            AND (game_groups.game_id = lfg_overlap_pairs.game_id OR games.provider_id = ?)
+            AND group_members.user_id = lfg_overlap_pairs.user_a
+            AND group_members.paused_at IS NULL
+            AND julianday(group_members.expires_at) > julianday('now')
+        ) OR NOT EXISTS (
+          SELECT 1 FROM game_groups
+          JOIN games ON games.id = game_groups.game_id
+          JOIN group_members ON group_members.group_id = game_groups.id
+          WHERE game_groups.guild_id = lfg_overlap_pairs.guild_id
+            AND (game_groups.game_id = lfg_overlap_pairs.game_id OR games.provider_id = ?)
+            AND group_members.user_id = lfg_overlap_pairs.user_b
+            AND group_members.paused_at IS NULL
+            AND julianday(group_members.expires_at) > julianday('now')
+        )
+      )
+  `).bind(
+    guildId,
+    ...gameIds,
+    ...gameIds,
+    ANY_GAME_PROVIDER_ID,
+    ANY_GAME_PROVIDER_ID,
+    ANY_GAME_PROVIDER_ID,
+  ).run();
 }
 
 async function claimNewOverlaps(
@@ -196,26 +220,43 @@ async function claimNewOverlaps(
   const now = new Date().toISOString();
   const claimed = await db.prepare(`
     INSERT OR IGNORE INTO lfg_overlap_pairs (guild_id, game_id, user_a, user_b, created_at)
-    SELECT ?, ?,
-      CASE WHEN ? < active.user_id THEN ? ELSE active.user_id END,
-      CASE WHEN ? < active.user_id THEN active.user_id ELSE ? END,
+    SELECT ?, active.pairGameId,
+      CASE WHEN ? < active.userId THEN ? ELSE active.userId END,
+      CASE WHEN ? < active.userId THEN active.userId ELSE ? END,
       ?
     FROM (
-      SELECT DISTINCT group_members.user_id
-      FROM game_groups
+      SELECT DISTINCT group_members.user_id AS userId,
+        CASE
+          WHEN target.provider_id = ? AND source_game.provider_id != ? THEN game_groups.game_id
+          ELSE ?
+        END AS pairGameId
+      FROM games AS target
+      JOIN game_groups ON game_groups.guild_id = ?
+      JOIN games AS source_game ON source_game.id = game_groups.game_id
       JOIN group_members ON group_members.group_id = game_groups.id
-      WHERE game_groups.guild_id = ? AND game_groups.game_id = ?
+      WHERE target.id = ?
+        AND (
+          game_groups.game_id = ?
+          OR source_game.provider_id = ?
+          OR target.provider_id = ?
+        )
         AND group_members.user_id != ?
         AND group_members.paused_at IS NULL
         AND julianday(group_members.expires_at) > julianday('now')
     ) AS active
     RETURNING CASE WHEN user_a = ? THEN user_b ELSE user_a END AS recipientUserId
   `).bind(
-    guildId, gameId,
+    guildId,
     actorId, actorId,
     actorId, actorId,
     now,
-    guildId, gameId, actorId,
+    ANY_GAME_PROVIDER_ID, ANY_GAME_PROVIDER_ID, gameId,
+    guildId,
+    gameId,
+    gameId,
+    ANY_GAME_PROVIDER_ID,
+    ANY_GAME_PROVIDER_ID,
+    actorId,
     actorId,
   ).all<ClaimedOverlap>();
   return [...new Set(claimed.results.map((row) => row.recipientUserId))];
@@ -321,22 +362,24 @@ export async function pruneExpiredGroupMembers(db: D1Database): Promise<void> {
     DELETE FROM lfg_overlap_pairs
     WHERE NOT EXISTS (
       SELECT 1 FROM game_groups
+      JOIN games ON games.id = game_groups.game_id
       JOIN group_members ON group_members.group_id = game_groups.id
       WHERE game_groups.guild_id = lfg_overlap_pairs.guild_id
-        AND game_groups.game_id = lfg_overlap_pairs.game_id
+        AND (game_groups.game_id = lfg_overlap_pairs.game_id OR games.provider_id = ?)
         AND group_members.user_id = lfg_overlap_pairs.user_a
         AND group_members.paused_at IS NULL
         AND julianday(group_members.expires_at) > julianday('now')
     ) OR NOT EXISTS (
       SELECT 1 FROM game_groups
+      JOIN games ON games.id = game_groups.game_id
       JOIN group_members ON group_members.group_id = game_groups.id
       WHERE game_groups.guild_id = lfg_overlap_pairs.guild_id
-        AND game_groups.game_id = lfg_overlap_pairs.game_id
+        AND (game_groups.game_id = lfg_overlap_pairs.game_id OR games.provider_id = ?)
         AND group_members.user_id = lfg_overlap_pairs.user_b
         AND group_members.paused_at IS NULL
         AND julianday(group_members.expires_at) > julianday('now')
     )
-  `).run();
+  `).bind(ANY_GAME_PROVIDER_ID, ANY_GAME_PROVIDER_ID).run();
 }
 
 export async function listGameGroups(db: D1Database): Promise<GameGroup[]> {
