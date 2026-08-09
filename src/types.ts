@@ -36,4 +36,5 @@ export interface Game {
   providerId?: string;
   coverUrl?: string;
   createdByUserId?: string;
+  deletedAt?: string;
 }
