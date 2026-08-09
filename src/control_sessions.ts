@@ -14,7 +14,6 @@ const OPENING_LEASE_MS = 15_000;
 export async function beginControlSession(
   db: D1Database,
   guildId: string,
-  gameId: string,
   userId: string,
   applicationId: string,
   interactionToken: string,
@@ -24,11 +23,11 @@ export async function beginControlSession(
   const staleBefore = new Date(now.getTime() - OPENING_LEASE_MS).toISOString();
   const row = await db.prepare(`
     INSERT INTO lfg_control_sessions (
-      guild_id, game_id, user_id,
+      guild_id, user_id,
       current_application_id, current_interaction_token, current_message_id,
       opening_nonce, opening_application_id, opening_interaction_token, opening_started_at, updated_at
-    ) VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?)
-    ON CONFLICT(guild_id, game_id, user_id) DO UPDATE SET
+    ) VALUES (?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?)
+    ON CONFLICT(guild_id, user_id) DO UPDATE SET
       opening_nonce = excluded.opening_nonce,
       opening_application_id = excluded.opening_application_id,
       opening_interaction_token = excluded.opening_interaction_token,
@@ -42,7 +41,6 @@ export async function beginControlSession(
       current_message_id AS currentMessageId
   `).bind(
     guildId,
-    gameId,
     userId,
     nonce,
     applicationId,
@@ -69,7 +67,6 @@ export async function beginControlSession(
 export async function promoteControlSession(
   db: D1Database,
   guildId: string,
-  gameId: string,
   userId: string,
   nonce: string,
   messageId: string,
@@ -84,15 +81,14 @@ export async function promoteControlSession(
       opening_interaction_token = NULL,
       opening_started_at = NULL,
       updated_at = ?
-    WHERE guild_id = ? AND game_id = ? AND user_id = ? AND opening_nonce = ?
-  `).bind(messageId, new Date().toISOString(), guildId, gameId, userId, nonce).run();
+    WHERE guild_id = ? AND user_id = ? AND opening_nonce = ?
+  `).bind(messageId, new Date().toISOString(), guildId, userId, nonce).run();
   return Boolean(result.meta.changes);
 }
 
 export async function cancelControlSessionOpening(
   db: D1Database,
   guildId: string,
-  gameId: string,
   userId: string,
   nonce: string,
 ): Promise<void> {
@@ -103,19 +99,18 @@ export async function cancelControlSessionOpening(
       opening_interaction_token = NULL,
       opening_started_at = NULL,
       updated_at = ?
-    WHERE guild_id = ? AND game_id = ? AND user_id = ? AND opening_nonce = ?
-  `).bind(new Date().toISOString(), guildId, gameId, userId, nonce).run();
+    WHERE guild_id = ? AND user_id = ? AND opening_nonce = ?
+  `).bind(new Date().toISOString(), guildId, userId, nonce).run();
   await db.prepare(`
     DELETE FROM lfg_control_sessions
-    WHERE guild_id = ? AND game_id = ? AND user_id = ?
+    WHERE guild_id = ? AND user_id = ?
       AND current_message_id IS NULL AND opening_nonce IS NULL
-  `).bind(guildId, gameId, userId).run();
+  `).bind(guildId, userId).run();
 }
 
 export async function refreshControlSessionToken(
   db: D1Database,
   guildId: string,
-  gameId: string,
   userId: string,
   messageId: string | undefined,
   applicationId: string | undefined,
@@ -125,23 +120,22 @@ export async function refreshControlSessionToken(
   await db.prepare(`
     UPDATE lfg_control_sessions
     SET current_application_id = ?, current_interaction_token = ?, updated_at = ?
-    WHERE guild_id = ? AND game_id = ? AND user_id = ? AND current_message_id = ?
-  `).bind(applicationId, interactionToken, new Date().toISOString(), guildId, gameId, userId, messageId).run();
+    WHERE guild_id = ? AND user_id = ? AND current_message_id = ?
+  `).bind(applicationId, interactionToken, new Date().toISOString(), guildId, userId, messageId).run();
 }
 
 export async function takeControlSession(
   db: D1Database,
   guildId: string,
-  gameId: string,
   userId: string,
 ): Promise<LfgControlReference | undefined> {
   const row = await db.prepare(`
     DELETE FROM lfg_control_sessions
-    WHERE guild_id = ? AND game_id = ? AND user_id = ?
+    WHERE guild_id = ? AND user_id = ?
     RETURNING current_application_id AS applicationId,
       current_interaction_token AS interactionToken,
       current_message_id AS messageId
-  `).bind(guildId, gameId, userId).first<LfgControlReference>();
+  `).bind(guildId, userId).first<LfgControlReference>();
   return row?.applicationId && row.interactionToken && row.messageId ? row : undefined;
 }
 
