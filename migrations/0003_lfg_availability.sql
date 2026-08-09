@@ -7,4 +7,3 @@ CREATE INDEX IF NOT EXISTS lfgs_availability_lookup
 ON lfgs (guild_id, expires_at, stopped_at, paused_at);
 
 DELETE FROM notification_actions;
-DROP TABLE notification_actions;
