@@ -1,4 +1,4 @@
-import { IgdbProvider, GameSelectionService } from "./games";
+import { collectDeletedCustomGames, IgdbProvider, GameSelectionService } from "./games";
 import { currentListenedGames, matchingLfgCreators, matchingListeners, recordNotificationAction } from "./notifications";
 import { InteractionType, ResponseType, json, option, userId, verifyDiscordRequest } from "./discord";
 import { canonicalTimeZone, discordTimestamp, effectiveTimeZone, parseWhen } from "./time";
@@ -7,7 +7,6 @@ import type { DiscordInteraction, Env, Game } from "./types";
 
 const gameOption = { name: "games", description: "Games", type: 3, required: true, autocomplete: true };
 const durationOption = { name: "duration", description: "Duration", type: 3 };
-const DELETE_CUSTOM_GAME_PREFIX = "__delete_custom__:";
 const commands = [
   { name: "listen", description: "Listen for game alerts", options: [gameOption, durationOption] },
   { name: "unlisten", description: "Stop game alerts", options: [gameOption, durationOption] },
@@ -49,6 +48,7 @@ export default {
   },
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
     await sendScheduledNotifications(env);
+    await collectDeletedCustomGames(env.DB);
   },
 } satisfies ExportedHandler<Env>;
 
@@ -67,27 +67,16 @@ async function autocomplete(interaction: DiscordInteraction, env: Env, games: Ga
   if (!managesListens && query && !filtered.some((game) => game.name.toLowerCase() === query.toLowerCase())) {
     filtered.push({ id: "custom", name: `Use "${query}"` });
   }
-
-  const payload: Array<{ name: string; value: string }> = [];
-  for (const game of filtered) {
-    if (payload.length >= 25) break;
+  return json({ type: ResponseType.Autocomplete, data: { choices: filtered.slice(0, 25).map((game) => {
     const customFallback = game.id === "custom";
-    const storedCustom = !customFallback && !game.providerId;
-    payload.push({
-      name: (storedCustom ? `${game.name} · custom` : game.name).slice(0, 100),
+    const suffix = game.deletedAt ? " · removed" : !customFallback && !game.providerId ? " · custom" : "";
+    return {
+      name: `${game.name}${suffix}`.slice(0, 100),
       value: prefix
         ? `${prefix}, ${customFallback ? query : game.name}`
         : customFallback ? query : game.name,
-    });
-    if (payload.length >= 25) break;
-    if (storedCustom && (game.createdByUserId === actor || canManageGuild(interaction))) {
-      payload.push({
-        name: `🗑 Delete ${game.name}`.slice(0, 100),
-        value: `${DELETE_CUSTOM_GAME_PREFIX}${game.id}`,
-      });
-    }
-  }
-  return json({ type: ResponseType.Autocomplete, data: { choices: payload } });
+    };
+  }) } });
 }
 
 async function command(i: DiscordInteraction, env: Env, games: GameSelectionService, ctx: ExecutionContext): Promise<Response> {
@@ -95,18 +84,12 @@ async function command(i: DiscordInteraction, env: Env, games: GameSelectionServ
   const actor = userId(i)!;
   try {
     const input = String(option(i, "games") ?? "");
-    if (input.startsWith(DELETE_CUSTOM_GAME_PREFIX)) {
-      const gameId = input.slice(DELETE_CUSTOM_GAME_PREFIX.length);
-      if (!gameId) throw new Error("Invalid custom game deletion.");
-      const deleted = await games.deleteCustomGame(i.guild_id!, gameId, actor, canManageGuild(i));
-      return message(`Deleted custom game **${deleted.name}**.`, true);
-    }
     const selected = name === "unlisten" || name === "mute"
       ? await resolveCurrentListens(env.DB, i.guild_id!, actor, input)
       : await games.resolve(i.guild_id!, input, actor);
     if (name === "listen") return listen(i, env, selected, "listen", actor, ctx);
     if (name === "unlisten" || name === "mute") return listen(i, env, selected, "unlisten", actor, ctx);
-    if (name === "lfg") return lfg(i, env, selected, actor);
+    if (name === "lfg") return lfg(i, env, selected, actor, ctx);
     if (name === "create") return createEvent(i, env, selected, actor, ctx);
   } catch (error) {
     return message(error instanceof Error ? error.message : "Could not complete that command.", true);
@@ -151,16 +134,23 @@ async function listen(
   if (action === "listen") {
     const newGames = games.filter((game) => !previouslyListening.some((current) => current.id === game.id));
     if (newGames.length) ctx.waitUntil(notifyNewListenMatches(env, i.guild_id!, i.channel_id!, actor, newGames));
+  } else {
+    ctx.waitUntil(collectDeletedCustomGames(env.DB));
   }
   const word = action === "listen" ? "Listening for" : "Not listening for";
   const content = `${word} ${gameNames(games)}${duration ? ` until ${discordTimestamp(duration)}` : ""}.`;
+  const deleteRows = customGameDeleteComponents(i, games, userZone.shouldPrompt ? 4 : 5);
+  const components = userZone.shouldPrompt ? [timezoneComponent(), ...deleteRows] : deleteRows;
   if (userZone.shouldPrompt) {
     await env.DB.prepare(
       "INSERT INTO users (guild_id, user_id, timezone_prompted_at) VALUES (?, ?, ?) ON CONFLICT(guild_id, user_id) DO UPDATE SET timezone_prompted_at = excluded.timezone_prompted_at",
     ).bind(i.guild_id, actor, new Date().toISOString()).run();
-    return json({ type: ResponseType.ChannelMessage, data: { content, flags: 64, components: [timezoneComponent()] } });
   }
-  return message(content, true);
+  return json({ type: ResponseType.ChannelMessage, data: {
+    content,
+    flags: 64,
+    components: components.length ? components : undefined,
+  } });
 }
 
 async function notifyNewListenMatches(env: Env, guildId: string, channelId: string, actor: string, games: Game[]): Promise<void> {
@@ -178,7 +168,7 @@ async function notifyNewListenMatches(env: Env, guildId: string, channelId: stri
   });
 }
 
-async function lfg(i: DiscordInteraction, env: Env, games: Game[], actor: string): Promise<Response> {
+async function lfg(i: DiscordInteraction, env: Env, games: Game[], actor: string, ctx: ExecutionContext): Promise<Response> {
   const userZone = await userTimeZone(env.DB, i.guild_id!, actor);
   const timeZone = userZone.timeZone;
   const duration = option(i, "duration") ? parseWhen(String(option(i, "duration")), timeZone) : new Date(Date.now() + 2 * 3_600_000);
@@ -192,6 +182,7 @@ async function lfg(i: DiscordInteraction, env: Env, games: Game[], actor: string
   const listeners = await matchingListeners(env.DB, i.guild_id!, games.map((game) => game.id), actor);
   const mentions = listeners.map((uid) => `<@${uid}>`).join(" ");
   const coverUrl = games.find((game) => game.coverUrl)?.coverUrl;
+  ctx.waitUntil(sendCustomGameControls(i, games));
   return json({ type: ResponseType.ChannelMessage, data: {
     content: mentions || undefined,
     embeds: [{
@@ -222,6 +213,7 @@ async function createEvent(i: DiscordInteraction, env: Env, games: Game[], actor
   const listeners = await matchingListeners(env.DB, i.guild_id!, games.map((game) => game.id), actor);
   const mentions = listeners.map((uid) => `<@${uid}>`).join(" ");
   const data = await eventMessageData(env.DB, id, i.guild_id!);
+  ctx.waitUntil(sendCustomGameControls(i, games));
   return json({ type: ResponseType.ChannelMessage, data: {
     ...data,
     content: mentions || undefined,
@@ -290,9 +282,68 @@ function eventComponents(eventId: string, games: Game[]): unknown[] {
   return components;
 }
 
+function customGameDeleteComponents(i: DiscordInteraction, games: Game[], maxRows = 5): unknown[] {
+  const actor = userId(i);
+  if (!actor) return [];
+  const canManage = canManageGuild(i);
+  const deletable = games.filter((game) => !game.providerId && !game.deletedAt && (game.createdByUserId === actor || canManage));
+  const rows: unknown[] = [];
+  for (let index = 0; index < deletable.length && rows.length < maxRows; index += 5) {
+    rows.push({
+      type: 1,
+      components: deletable.slice(index, index + 5).map((game) => ({
+        type: 2,
+        style: 4,
+        label: `Delete ${game.name}`.slice(0, 80),
+        custom_id: `custom-game-delete:${game.id}`,
+      })),
+    });
+  }
+  return rows;
+}
+
+async function sendCustomGameControls(i: DiscordInteraction, games: Game[]): Promise<void> {
+  if (!i.application_id) return;
+  const components = customGameDeleteComponents(i, games);
+  if (!components.length) return;
+  const response = await fetch(`https://discord.com/api/v10/webhooks/${i.application_id}/${i.token}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ content: "Custom game controls", flags: 64, components }),
+  });
+  if (!response.ok) console.error("Discord custom game controls failed", response.status, await response.text());
+}
+
+async function eventAcceptsChanges(db: D1Database, eventId: string): Promise<boolean> {
+  const event = await db.prepare(`
+    SELECT events.starts_at, event_triggers.fired_at
+    FROM events LEFT JOIN event_triggers ON event_triggers.event_id = events.id
+    WHERE events.id = ?
+  `).bind(eventId).first<{ starts_at?: string; fired_at?: string }>();
+  if (!event) return false;
+  if (event.starts_at) return new Date(event.starts_at).getTime() > Date.now();
+  return !event.fired_at;
+}
+
 async function component(i: DiscordInteraction, env: Env, ctx: ExecutionContext): Promise<Response> {
   const parts = i.data?.custom_id?.split(":") ?? [];
   const action = parts[0];
+  if (action === "custom-game-delete") {
+    const gameId = parts[1];
+    if (!gameId || !i.guild_id || !userId(i)) return message("Invalid custom game deletion.", true);
+    try {
+      const games = new GameSelectionService(env.DB, getIgdbProvider(env));
+      const result = await games.deleteCustomGame(i.guild_id, gameId, userId(i)!, canManageGuild(i));
+      return message(
+        result.collected
+          ? `Deleted custom game **${result.game.name}**.`
+          : `Removed **${result.game.name}** from future selections. Existing LFGs, events, and listens will keep working until they finish.`,
+        true,
+      );
+    } catch (error) {
+      return message(error instanceof Error ? error.message : "Could not delete that custom game.", true);
+    }
+  }
   if (action === "timezone") {
     const sub = parts[1];
     if (sub === "select") {
@@ -336,6 +387,9 @@ async function component(i: DiscordInteraction, env: Env, ctx: ExecutionContext)
   if (!eventId) return message("Invalid event action.", true);
   const event = await env.DB.prepare("SELECT id FROM events WHERE id = ? AND guild_id = ?").bind(eventId, i.guild_id).first();
   if (!event) return message("This event is not available in this server.", true);
+  if ((action === "rsvp" || action === "vote") && !await eventAcceptsChanges(env.DB, eventId)) {
+    return message("This event is no longer accepting changes.", true);
+  }
   if (action === "rsvp" && ["yes", "maybe", "no"].includes(status ?? "")) {
     await env.DB.prepare("INSERT INTO rsvps (event_id, user_id, status, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(event_id, user_id) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at")
       .bind(eventId, userId(i), status, new Date().toISOString()).run();
