@@ -29,7 +29,6 @@ import {
   type GroupMember,
   type MembershipUpdate,
 } from "./lfg";
-import { reconcileLegacyLfgs } from "./legacy_lfg";
 import { ResponseType, json, userId } from "./discord";
 import { discordTimestamp } from "./time";
 import type { DiscordInteraction, Env, Game } from "./types";
@@ -44,7 +43,6 @@ export async function handleLfgCommand(
   expiresAt: Date,
   ctx: ExecutionContext,
 ): Promise<Response> {
-  await reconcileLegacyLfgs(env.DB);
   const updates: MembershipUpdate[] = [];
   for (const game of games) {
     updates.push(await upsertGameMembership(env.DB, i.guild_id!, i.channel_id!, actor, game, expiresAt));
@@ -72,7 +70,6 @@ export async function handleGroupComponent(i: DiscordInteraction, env: Env, ctx:
   const actor = userId(i);
   if (!i.guild_id || !actor || !gameId || !action || action === "busy") return ephemeral("This group action is not available.");
 
-  await reconcileLegacyLfgs(env.DB);
   const group = await loadGameGroup(env.DB, i.guild_id, gameId);
   const snapshot = await loadGameGroupSnapshot(env.DB, i.guild_id, gameId);
   if (!group || !snapshot) return ephemeral("That game group no longer exists.");
@@ -107,7 +104,7 @@ async function finalizeManagePanel(
   if (!messageId) return;
   const current = await finalizeControlSession(env.DB, i.guild_id, gameId, actor, pending.nonce, messageId);
   if (!current) {
-    await deleteWebhookMessage(i.application_id, i.token, messageId);
+    await deleteOriginalWebhookMessage(i.application_id, i.token);
     return;
   }
   if (pending.previous?.messageId) await deleteStoredControlMessage(pending.previous);
@@ -276,7 +273,6 @@ export async function syncGamePanel(env: Env, guildId: string, gameId: string, p
 }
 
 export async function syncSharedGameGroups(env: Env): Promise<void> {
-  await reconcileLegacyLfgs(env.DB);
   await pruneExpiredGroupMembers(env.DB);
   await pruneControlSessions(env.DB);
   await ensureGroupsForUpcomingEvents(env.DB);
@@ -375,27 +371,29 @@ async function deleteChannelMessage(env: Env, channelId: string, messageId: stri
 }
 
 async function interactionOriginalMessageId(applicationId: string, token: string): Promise<string | undefined> {
-  try {
-    const response = await fetch(`https://discord.com/api/v10/webhooks/${applicationId}/${token}/messages/@original`);
-    if (!response.ok) {
+  for (const delay of [0, 100, 250]) {
+    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+    try {
+      const response = await fetch(`https://discord.com/api/v10/webhooks/${applicationId}/${token}/messages/@original`);
+      if (response.ok) return (await response.json() as { id?: string }).id;
+      if (response.status === 404) continue;
       console.error("Discord interaction message lookup failed", response.status, await response.text());
       return undefined;
+    } catch (error) {
+      if (delay === 250) console.error("Discord interaction message lookup request failed", error);
     }
-    return (await response.json() as { id?: string }).id;
-  } catch (error) {
-    console.error("Discord interaction message lookup request failed", error);
-    return undefined;
   }
+  return undefined;
 }
 
 async function deleteStoredControlMessage(session: LfgControlSession): Promise<void> {
   if (!session.messageId) return;
-  await deleteWebhookMessage(session.applicationId, session.interactionToken, session.messageId);
+  await deleteOriginalWebhookMessage(session.applicationId, session.interactionToken);
 }
 
-async function deleteWebhookMessage(applicationId: string, token: string, messageId: string): Promise<boolean> {
+async function deleteOriginalWebhookMessage(applicationId: string, token: string): Promise<boolean> {
   try {
-    const response = await fetch(`https://discord.com/api/v10/webhooks/${applicationId}/${token}/messages/${messageId}`, { method: "DELETE" });
+    const response = await fetch(`https://discord.com/api/v10/webhooks/${applicationId}/${token}/messages/@original`, { method: "DELETE" });
     if (!response.ok && response.status !== 404) console.error("Discord control message delete failed", response.status, await response.text());
     return response.ok || response.status === 404;
   } catch (error) {
