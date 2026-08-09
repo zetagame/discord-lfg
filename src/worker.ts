@@ -10,6 +10,7 @@ type DeferredSpec = {
   type: typeof ResponseType.DeferredChannelMessage | typeof ResponseType.DeferredUpdateMessage;
   flags?: number;
   ignoreUpdateResult?: boolean;
+  recreateAfterCompletion?: boolean;
 };
 
 type CallbackResponse = {
@@ -59,8 +60,12 @@ async function registerCommands(request: Request, env: Env, ctx: ExecutionContex
 
 function deferredSpec(interaction: DiscordInteraction): DeferredSpec | undefined {
   if (interaction.type === InteractionType.ApplicationCommand) {
-    const flags = interaction.data?.name === "lfg" ? EPHEMERAL | IS_COMPONENTS_V2 : undefined;
-    return { type: ResponseType.DeferredChannelMessage, flags };
+    const isLfg = interaction.data?.name === "lfg";
+    return {
+      type: ResponseType.DeferredChannelMessage,
+      flags: isLfg ? EPHEMERAL | IS_COMPONENTS_V2 : undefined,
+      recreateAfterCompletion: isLfg,
+    };
   }
 
   if (interaction.type === InteractionType.ModalSubmit) {
@@ -160,6 +165,14 @@ async function finalizeDeferred(
   }
 
   if (spec.type === ResponseType.DeferredChannelMessage && callback.type === ResponseType.ChannelMessage) {
+    if (spec.recreateAfterCompletion) {
+      // A deferred response message is created when we ACK, before /lfg has
+      // finished projecting its public panel. Recreate the final manager only
+      // after projection completes so it is chronologically below that panel.
+      await deleteInteractionOriginal(interaction);
+      await postInteractionFollowup(interaction, data);
+      return;
+    }
     const finalFlags = typeof data.flags === "number" ? data.flags : 0;
     const deferredFlags = spec.flags ?? 0;
     const immutableFlagsChanged = ((finalFlags ^ deferredFlags) & (EPHEMERAL | IS_COMPONENTS_V2)) !== 0;
