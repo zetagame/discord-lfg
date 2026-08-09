@@ -73,9 +73,9 @@ export class GameSelectionService {
   }
 
   async resolve(guildId: string, input: string, createdByUserId?: string): Promise<Game[]> {
-    const names = [...new Set(input.split(",").map((name) => name.trim()).filter(Boolean))];
-    if (!names.length) throw new Error("Choose at least one game.");
-    return Promise.all(names.map((name) => this.resolveOne(guildId, name, createdByUserId)));
+    const name = input.trim();
+    if (!name) throw new Error("Choose a game.");
+    return [await this.resolveOne(guildId, name, createdByUserId)];
   }
 
   async deleteCustomGame(
