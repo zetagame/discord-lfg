@@ -32,8 +32,7 @@ export function parseDuration(input: string | undefined, now = new Date()): Date
 
 export function parseWhen(input: string, timeZone: string, now = new Date()): Date | undefined {
   const value = input.trim().toLowerCase();
-  const until = /^until\s+(.+)$/.exec(value);
-  if (until) return parseUntil(until[1]!, timeZone, now);
+  if (value.startsWith("until ")) return parseUntil(value.slice(6).trim(), timeZone, now);
   const date = /^\d{4}-\d{2}-\d{2}(?:[ t](\d{1,2})(?::(\d{2}))?)?$/.exec(value);
   if (date) {
     const [year, month, day] = value.slice(0, 10).split("-").map(Number);

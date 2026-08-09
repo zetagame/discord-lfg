@@ -104,7 +104,19 @@ async function component(i: DiscordInteraction, env: Env): Promise<Response> {
   if (action === "rsvp" && ["yes", "maybe", "no"].includes(status ?? "")) {
     await env.DB.prepare("INSERT INTO rsvps (event_id, user_id, status, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(event_id, user_id) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at")
       .bind(eventId, userId(i), status, new Date().toISOString()).run();
+    await fireRsvpTrigger(env.DB, eventId);
     return message(`RSVP updated to ${status}.`, true);
+  }
+
+  async function fireRsvpTrigger(db: D1Database, eventId: string): Promise<void> {
+    const trigger = await db.prepare("SELECT type, threshold, fired_at FROM event_triggers WHERE event_id = ?").bind(eventId)
+      .first<{ type: string; threshold: number; fired_at?: string }>();
+    if (!trigger || trigger.fired_at || !["yes_rsvps", "yes-or-maybe_rsvps"].includes(trigger.type)) return;
+    const statuses = trigger.type === "yes_rsvps" ? ["yes"] : ["yes", "maybe"];
+    const count = await db.prepare(`SELECT COUNT(*) AS count FROM rsvps WHERE event_id = ? AND status IN (${statuses.map(() => "?").join(",")})`)
+      .bind(eventId, ...statuses).first<{ count: number }>();
+    if ((count?.count ?? 0) >= trigger.threshold) await db.prepare("UPDATE event_triggers SET fired_at = ? WHERE event_id = ? AND fired_at IS NULL")
+      .bind(new Date().toISOString(), eventId).run();
   }
   if (action === "vote") {
     const values = i.data?.values ?? [];
