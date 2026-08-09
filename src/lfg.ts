@@ -9,6 +9,7 @@ export interface GameGroup {
   channelId?: string;
   discordMessageId?: string;
   panelClaimToken?: string;
+  panelClaimedAt?: string;
 }
 
 export interface GroupMember {
@@ -73,7 +74,8 @@ export async function ensureGameGroup(
 export async function loadGameGroup(db: D1Database, guildId: string, gameId: string): Promise<GameGroup | undefined> {
   const row = await db.prepare(`
     SELECT id, guild_id AS guildId, game_id AS gameId, channel_id AS channelId,
-      discord_message_id AS discordMessageId, panel_claim_token AS panelClaimToken
+      discord_message_id AS discordMessageId, panel_claim_token AS panelClaimToken,
+      panel_claimed_at AS panelClaimedAt
     FROM game_groups WHERE guild_id = ? AND game_id = ?
   `).bind(guildId, gameId).first<GameGroup>();
   return row ?? undefined;
@@ -338,7 +340,8 @@ export async function pruneExpiredGroupMembers(db: D1Database): Promise<void> {
 export async function listGameGroups(db: D1Database): Promise<GameGroup[]> {
   const rows = await db.prepare(`
     SELECT id, guild_id AS guildId, game_id AS gameId, channel_id AS channelId,
-      discord_message_id AS discordMessageId, panel_claim_token AS panelClaimToken
+      discord_message_id AS discordMessageId, panel_claim_token AS panelClaimToken,
+      panel_claimed_at AS panelClaimedAt
     FROM game_groups
   `).all<GameGroup>();
   return rows.results;
@@ -350,10 +353,16 @@ export async function claimPanelCreation(
   channelId: string,
   token: string,
 ): Promise<boolean> {
+  const now = new Date().toISOString();
   const result = await db.prepare(`
-    UPDATE game_groups SET panel_claim_token = ?, channel_id = ?
-    WHERE id = ? AND discord_message_id IS NULL AND panel_claim_token IS NULL
-  `).bind(token, channelId, groupId).run();
+    UPDATE game_groups
+    SET panel_claim_token = ?, panel_claimed_at = ?, channel_id = ?
+    WHERE id = ? AND discord_message_id IS NULL
+      AND (
+        panel_claim_token IS NULL OR panel_claimed_at IS NULL
+        OR julianday(panel_claimed_at) <= julianday('now', '-2 minutes')
+      )
+  `).bind(token, now, channelId, groupId).run();
   return Boolean(result.meta.changes);
 }
 
@@ -363,22 +372,26 @@ export async function savePanelMessage(
   token: string,
   channelId: string,
   messageId: string,
-): Promise<void> {
-  await db.prepare(`
+): Promise<boolean> {
+  const result = await db.prepare(`
     UPDATE game_groups
-    SET discord_message_id = ?, channel_id = ?, panel_claim_token = NULL
-    WHERE id = ? AND panel_claim_token = ?
+    SET discord_message_id = ?, channel_id = ?, panel_claim_token = NULL, panel_claimed_at = NULL
+    WHERE id = ? AND discord_message_id IS NULL AND panel_claim_token = ?
   `).bind(messageId, channelId, groupId, token).run();
+  return Boolean(result.meta.changes);
 }
 
 export async function releasePanelClaim(db: D1Database, groupId: string, token: string): Promise<void> {
-  await db.prepare("UPDATE game_groups SET panel_claim_token = NULL WHERE id = ? AND panel_claim_token = ?")
-    .bind(groupId, token).run();
+  await db.prepare(`
+    UPDATE game_groups SET panel_claim_token = NULL, panel_claimed_at = NULL
+    WHERE id = ? AND panel_claim_token = ?
+  `).bind(groupId, token).run();
 }
 
 export async function clearPanelMessage(db: D1Database, groupId: string, messageId: string): Promise<void> {
   await db.prepare(`
-    UPDATE game_groups SET discord_message_id = NULL, panel_claim_token = NULL
+    UPDATE game_groups
+    SET discord_message_id = NULL, panel_claim_token = NULL, panel_claimed_at = NULL
     WHERE id = ? AND discord_message_id = ?
   `).bind(groupId, messageId).run();
 }
