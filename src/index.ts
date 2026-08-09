@@ -7,6 +7,7 @@ import type { DiscordInteraction, Env, Game } from "./types";
 
 const gameOption = { name: "games", description: "Games", type: 3, required: true, autocomplete: true };
 const durationOption = { name: "duration", description: "Duration", type: 3 };
+const DELETE_CUSTOM_GAME_PREFIX = "__delete_custom__:";
 const commands = [
   { name: "listen", description: "Listen for game alerts", options: [gameOption, durationOption] },
   { name: "unlisten", description: "Stop game alerts", options: [gameOption, durationOption] },
@@ -57,18 +58,36 @@ async function autocomplete(interaction: DiscordInteraction, env: Env, games: Ga
   const query = parts.at(-1)?.trim() ?? "";
   const selectedNames = parts.slice(0, -1).map((part) => part.trim()).filter(Boolean);
   const prefix = selectedNames.join(", ");
+  const actor = userId(interaction)!;
   const managesListens = interaction.data?.name === "unlisten" || interaction.data?.name === "mute";
   const choices = managesListens
-    ? await currentListenedGames(env.DB, interaction.guild_id!, userId(interaction)!, query)
+    ? await currentListenedGames(env.DB, interaction.guild_id!, actor, query)
     : await games.search(interaction.guild_id!, query);
   const filtered = choices.filter((game) => !selectedNames.some((name) => name.toLowerCase() === game.name.toLowerCase()));
   if (!managesListens && query && !filtered.some((game) => game.name.toLowerCase() === query.toLowerCase())) {
     filtered.push({ id: "custom", name: `Use "${query}"` });
   }
-  return json({ type: ResponseType.Autocomplete, data: { choices: filtered.slice(0, 25).map((game) => ({
-    name: game.name,
-    value: prefix ? `${prefix}, ${game.id === "custom" ? query : game.name}` : game.id === "custom" ? query : game.name,
-  })) } });
+
+  const payload: Array<{ name: string; value: string }> = [];
+  for (const game of filtered) {
+    if (payload.length >= 25) break;
+    const customFallback = game.id === "custom";
+    const storedCustom = !customFallback && !game.providerId;
+    payload.push({
+      name: (storedCustom ? `${game.name} · custom` : game.name).slice(0, 100),
+      value: prefix
+        ? `${prefix}, ${customFallback ? query : game.name}`
+        : customFallback ? query : game.name,
+    });
+    if (payload.length >= 25) break;
+    if (storedCustom && (game.createdByUserId === actor || canManageGuild(interaction))) {
+      payload.push({
+        name: `🗑 Delete ${game.name}`.slice(0, 100),
+        value: `${DELETE_CUSTOM_GAME_PREFIX}${game.id}`,
+      });
+    }
+  }
+  return json({ type: ResponseType.Autocomplete, data: { choices: payload } });
 }
 
 async function command(i: DiscordInteraction, env: Env, games: GameSelectionService, ctx: ExecutionContext): Promise<Response> {
@@ -76,9 +95,15 @@ async function command(i: DiscordInteraction, env: Env, games: GameSelectionServ
   const actor = userId(i)!;
   try {
     const input = String(option(i, "games") ?? "");
+    if (input.startsWith(DELETE_CUSTOM_GAME_PREFIX)) {
+      const gameId = input.slice(DELETE_CUSTOM_GAME_PREFIX.length);
+      if (!gameId) throw new Error("Invalid custom game deletion.");
+      const deleted = await games.deleteCustomGame(i.guild_id!, gameId, actor, canManageGuild(i));
+      return message(`Deleted custom game **${deleted.name}**.`, true);
+    }
     const selected = name === "unlisten" || name === "mute"
       ? await resolveCurrentListens(env.DB, i.guild_id!, actor, input)
-      : await games.resolve(i.guild_id!, input);
+      : await games.resolve(i.guild_id!, input, actor);
     if (name === "listen") return listen(i, env, selected, "listen", actor, ctx);
     if (name === "unlisten" || name === "mute") return listen(i, env, selected, "unlisten", actor, ctx);
     if (name === "lfg") return lfg(i, env, selected, actor);
@@ -87,6 +112,15 @@ async function command(i: DiscordInteraction, env: Env, games: GameSelectionServ
     return message(error instanceof Error ? error.message : "Could not complete that command.", true);
   }
   return message("Unknown command.", true);
+}
+
+function canManageGuild(i: DiscordInteraction): boolean {
+  try {
+    const permissions = BigInt(i.member?.permissions ?? "0");
+    return (permissions & 8n) !== 0n || (permissions & 32n) !== 0n;
+  } catch {
+    return false;
+  }
 }
 
 async function resolveCurrentListens(db: D1Database, guildId: string, actor: string, input: string): Promise<Game[]> {
