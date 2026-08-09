@@ -11,6 +11,9 @@ CREATE TABLE IF NOT EXISTS lfg_control_sessions (
   application_id TEXT NOT NULL,
   interaction_token TEXT NOT NULL,
   message_id TEXT,
+  previous_application_id TEXT,
+  previous_interaction_token TEXT,
+  previous_message_id TEXT,
   updated_at TEXT NOT NULL,
   PRIMARY KEY (guild_id, game_id, user_id)
 );
