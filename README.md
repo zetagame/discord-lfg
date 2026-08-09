@@ -21,7 +21,7 @@ Interactions over HTTP; it does not require a Gateway connection.
    production commands.
 6. Run `npm run check`, `npm test`, and `npm run deploy` as appropriate. The
    deployed Worker needs the five-minute Cron Trigger in `wrangler.jsonc` for
-   event notifications, LFG expiry refreshes, and custom-game garbage collection.
+   event notifications, shared-group expiry refreshes, and custom-game garbage collection.
 
 `npm run typecheck` is an alias for the type check. For a remote D1 database,
 use `npx wrangler d1 migrations apply discord-lfg --remote`.
@@ -39,19 +39,18 @@ no local Wrangler login.
 
 ## Commands
 
-- `/lfg Games [Duration]` opens an availability window, valid for two hours by
-  default. Its card shows the distinct number of currently available users for
-  each selected game.
+- `/lfg Games [Duration]` adds or extends your membership in each selected
+  game's shared group. The default duration is two hours.
 - `/create Games When` creates an RSVP event. The creator starts as Yes. One
   game has only RSVP buttons; multiple games also have a separate game-voting
   select.
 
-There is no separate listen/mute state. LFG cards have a blue **Pause** button
-and red **Stop** button. Pause removes that window from availability counts but
-keeps its original expiry; after pausing, the blue button becomes **Resume**.
-Stop permanently ends that LFG. Button interactions acknowledge immediately
-with disabled loading controls, then update to the committed state; failures
-restore the current card and return an ephemeral error.
+There is no separate listen/mute state. Your `/lfg` response is ephemeral and
+contains a blue **Pause** button and red **Stop** button for your membership.
+Pause immediately removes you from the public group's count while preserving
+your expiry; after pausing, your blue control becomes **Resume**. Button actions
+acknowledge with disabled loading controls before committing and restore the
+current state with an ephemeral error if the operation fails.
 
 Durations accept `30m`, `2h`, `3d`, `today`, `tonight`, `tomorrow`, `this
 weekend`, `until 10pm`, and `until Friday`. Event times also accept scheduled
@@ -60,19 +59,29 @@ local timestamps such as `2026-08-09 20:00`, and trigger phrases such as
 
 ## LFG behavior
 
-Availability is derived only from active, unpaused, unexpired LFG windows.
-Counts are distinct by user, so multiple active LFG records from one person do
-not inflate a game's count.
+There is one public panel per guild/game, rather than one public message per
+person. The panel shows **N in group**, where N is the number of active,
+unpaused, unexpired members. Pausing therefore decrements the visible count
+immediately; resuming increments it again.
 
-When a new LFG or a resumed LFG creates a new overlap for a user/game pair, the
-bot sends one deduplicated Discord message tagging the already-available users.
-The message lists the newly overlapping games and their current counts. Creating
-another LFG for a game the same user is already actively available for does not
-create another overlap notification.
+Running `/lfg` again for a game you are already in does not create another LFG.
+It extends your existing expiry to the later of the current expiry or the newly
+requested expiry. Running it again while paused also resumes you.
 
-The Worker stores each LFG's Discord message ID. New overlaps, pause/resume,
-stop, and expiry refresh affected LFG cards in place so per-game counts stay
-current. Expiry is finalized by the existing five-minute scheduled Worker tick.
+When a user newly joins or resumes into overlap with existing active members,
+the bot sends one deduplicated mention notification for the new overlap. Pair
+claims in D1 prevent concurrent requests from double-notifying the same overlap.
+
+A game's public panel exists while at least one LFG member is active. It also
+appears during the hour before a scheduled event for that game. The current
+event model has no capacity field, so scheduled events are treated as open for
+this panel-lifecycle rule. Once neither condition applies, the Worker removes
+the public panel. The five-minute scheduled Worker tick handles expiries and
+panel lifecycle as a fallback.
+
+The shared public panel has **Manage my LFG**, which opens personalized ephemeral
+controls. This keeps Pause/Resume state personal even though Discord message
+components themselves cannot render differently for different viewers.
 
 ## Data behavior
 
@@ -85,8 +94,9 @@ instance until shortly before expiry.
 Custom games can be soft-deleted by their creator; members with Manage Server
 or Administrator can remove any custom game in the guild. Soft deletion hides
 the game from future selection immediately. Physical deletion waits until no
-open LFG or active event references it. Garbage collection runs on the initial
-delete attempt, after an LFG is stopped, and on the scheduled Worker tick.
+open group membership, public group panel, or active event references it.
+Garbage collection runs on explicit membership stop and on the scheduled Worker
+tick.
 
 Users without an explicit IANA timezone use `America/New_York`. On first use,
 the bot sends a one-time optional ephemeral timezone selector. Scheduled input
