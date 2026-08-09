@@ -13,6 +13,7 @@ export interface DiscordInteraction {
   type: number;
   guild_id?: string;
   channel_id?: string;
+  message?: { id: string };
   member?: { user: { id: string; username: string }; permissions?: string };
   user?: { id: string; username: string };
   data?: {
