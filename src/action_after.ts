@@ -8,6 +8,12 @@ const DEFAULT_RETRIES = 2;
 
 export class PermanentActionError extends Error {}
 
+export class RetryableActionError extends Error {
+  constructor(message: string, readonly retryAfterMs = 0) {
+    super(message);
+  }
+}
+
 /**
  * Runs a side effect immediately after a successful write. Each attempt gets
  * its own abort signal and deadline; callers should pass the signal to network
@@ -44,6 +50,10 @@ export async function actionAfter<T>(
       if (error instanceof PermanentActionError) break;
     } finally {
       if (timeout) clearTimeout(timeout);
+    }
+
+    if (attempt <= retries && lastError instanceof RetryableActionError && lastError.retryAfterMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, lastError.retryAfterMs));
     }
   }
 
