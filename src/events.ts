@@ -84,27 +84,46 @@ export async function claimMinimumPlayerCheck(
       AND julianday(events.starts_at) <= julianday(?, '+30 minutes')
   `).bind(nowIso, eventId, nowIso, nowIso).run();
 
+  const claim = await db.prepare(`
+    UPDATE event_min_player_checks
+    SET delivery_claimed_at = ?
+    WHERE event_id = ?
+      AND alerted_at IS NULL
+      AND (
+        delivery_claimed_at IS NULL
+        OR julianday(delivery_claimed_at) <= julianday(?, '-4 minutes')
+      )
+  `).bind(nowIso, eventId, nowIso).run();
+  if (!claim.meta.changes) return undefined;
+
   const check = await db.prepare(`
-    SELECT event_min_player_checks.yes_count AS yesCount,
-      event_min_player_checks.alerted_at AS alertedAt
+    SELECT event_min_player_checks.yes_count AS yesCount
     FROM event_min_player_checks
     JOIN events ON events.id = event_min_player_checks.event_id
     WHERE event_min_player_checks.event_id = ?
       AND events.deleted_at IS NULL
       AND events.starts_at IS NOT NULL
       AND julianday(events.starts_at) > julianday(?)
-  `).bind(eventId, nowIso).first<{ yesCount: number; alertedAt?: string }>();
-  return check && !check.alertedAt ? check.yesCount : undefined;
+  `).bind(eventId, nowIso).first<{ yesCount: number }>();
+  if (check) return check.yesCount;
+  await releaseMinimumPlayerCheck(db, eventId);
+  return undefined;
 }
 
 export async function markMinimumPlayerAlerted(db: D1Database, eventId: string, now = new Date()): Promise<void> {
-  await db.prepare("UPDATE event_min_player_checks SET alerted_at = ? WHERE event_id = ? AND alerted_at IS NULL")
-    .bind(now.toISOString(), eventId).run();
+  await db.prepare(`
+    UPDATE event_min_player_checks
+    SET alerted_at = ?, delivery_claimed_at = NULL
+    WHERE event_id = ? AND alerted_at IS NULL
+  `).bind(now.toISOString(), eventId).run();
 }
 
-export async function releaseMinimumPlayerCheck(_db: D1Database, _eventId: string): Promise<void> {
-  // The stored Yes-RSVP snapshot is the idempotency key for this check. Keep it
-  // across delivery failures so retries do not silently change the 30-minute observation.
+export async function releaseMinimumPlayerCheck(db: D1Database, eventId: string): Promise<void> {
+  await db.prepare(`
+    UPDATE event_min_player_checks
+    SET delivery_claimed_at = NULL
+    WHERE event_id = ? AND alerted_at IS NULL
+  `).bind(eventId).run();
 }
 
 export async function fireRsvpTrigger(db: D1Database, eventId: string, now = new Date()): Promise<boolean> {
