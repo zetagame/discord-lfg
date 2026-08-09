@@ -135,7 +135,6 @@ async function syncGamePanelAttempt(
     throw new RetryableActionError("Another worker is projecting this panel", 100);
   }
 
-  let createdMessageId: string | undefined;
   try {
     const nonce = await ensurePanelCreateNonce(env.DB, snapshot.group.id);
     const response = await createPanelMessage(
@@ -146,7 +145,6 @@ async function syncGamePanelAttempt(
     );
     const body = await response.json() as { id?: string };
     if (!body.id) throw new RetryableActionError("Discord returned a panel response without a message id.");
-    createdMessageId = body.id;
     const saved = await savePanelMessage(env.DB, snapshot.group.id, claim, panelChannel, body.id);
     if (!saved) {
       const current = await loadGameGroup(env.DB, guildId, gameId);
@@ -246,7 +244,7 @@ async function editPanelMessage(
   }
   if (response.ok) return "updated";
   if (response.status === 404) return "missing";
-  await throwDiscordFailure(response, "edit shared LFG panel");
+  return await throwDiscordFailure(response, "edit shared LFG panel");
 }
 
 async function deletePanelMessage(env: Env, channelId: string, messageId: string, signal: AbortSignal): Promise<void> {
@@ -263,7 +261,7 @@ async function deletePanelMessage(env: Env, channelId: string, messageId: string
     throw new RetryableActionError(`Discord panel delete request failed: ${error instanceof Error ? error.message : String(error)}`);
   }
   if (response.ok || response.status === 404) return;
-  await throwDiscordFailure(response, "delete shared LFG panel");
+  return await throwDiscordFailure(response, "delete shared LFG panel");
 }
 
 async function throwDiscordFailure(response: Response, action: string): Promise<never> {
