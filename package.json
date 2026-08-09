@@ -6,10 +6,11 @@
   "scripts": {
     "check": "tsc",
     "typecheck": "tsc",
-    "deploy": "wrangler deploy",
+    "deploy": "npm run migrations:remote && wrangler deploy",
     "dev": "wrangler dev",
     "test": "tsx --test test/*.test.ts",
     "migrations": "wrangler d1 migrations apply discord-lfg --local",
+    "migrations:remote": "wrangler d1 migrations apply DB --remote",
     "register-commands": "node scripts/register-commands.mjs"
   },
   "repository": {
