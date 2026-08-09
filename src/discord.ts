@@ -9,9 +9,9 @@ export function json(body: unknown): Response {
 
 /**
  * The bot currently has one autocomplete surface: the comma-delimited game
- * field shared by /lfg and /create. Leaving a comma after every selected choice
- * keeps Discord's autocomplete focused on the next game while a trailing empty
- * item remains harmless to the existing comma parser on submit.
+ * field shared by /lfg and /create. The visible choice text must carry the same
+ * accumulated value as the submitted choice; otherwise Discord shows only the
+ * current game's label and selecting it does not leave the comma in the field.
  */
 export function chainAutocompleteChoices(body: unknown): unknown {
   if (!isAutocompleteResponse(body)) return body;
@@ -20,9 +20,11 @@ export function chainAutocompleteChoices(body: unknown): unknown {
     data: {
       ...body.data,
       choices: body.data.choices.map((choice) => {
-        if (typeof choice.value !== "string" || choice.value.endsWith(", ")) return choice;
-        // Discord caps string autocomplete choice values at 100 characters.
-        return choice.value.length <= 98 ? { ...choice, value: `${choice.value}, ` } : choice;
+        if (typeof choice.value !== "string") return choice;
+        const chained = choice.value.endsWith(", ")
+          ? choice.value
+          : choice.value.length <= 98 ? `${choice.value}, ` : choice.value;
+        return { ...choice, name: chained, value: chained };
       }),
     },
   };
