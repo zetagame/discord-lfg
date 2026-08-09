@@ -28,6 +28,7 @@ import type { Env } from "./types";
 
 const PANEL_ATTEMPT_TIMEOUT_MS = 3000;
 const PANEL_RETRIES = 2;
+const IS_COMPONENTS_V2 = 1 << 15;
 
 type PanelEditResult = "updated" | "missing";
 
@@ -167,36 +168,42 @@ async function finishProjection(env: Env, groupId: string, targetRevision: numbe
 }
 
 async function gamePanelData(env: Env, snapshot: GameGroupSnapshot, signal: AbortSignal): Promise<Record<string, unknown>> {
-  const fields: Array<Record<string, unknown>> = [];
   const members = await lfgMemberLines(env, snapshot.group.guildId, snapshot.activeUserIds, signal);
-  if (members.length) fields.push({ name: "In group", value: embedValue(members.join("\n")), inline: false });
+  const body: string[] = [`**${snapshot.activeUserIds.length} in group**`];
+  if (members.length) body.push(`### In group\n${members.join("\n")}`);
   if (snapshot.upcomingEvent) {
-    fields.push({
-      name: "Upcoming event",
-      value: `**${snapshot.upcomingEvent.title}** · ${discordTimestamp(new Date(snapshot.upcomingEvent.startsAt))}\n${snapshot.upcomingEvent.yesCount} going`,
-      inline: false,
-    });
+    body.push(
+      `### Upcoming event\n**${snapshot.upcomingEvent.title}** · ${discordTimestamp(new Date(snapshot.upcomingEvent.startsAt))}\n${snapshot.upcomingEvent.yesCount} going`,
+    );
   }
+
+  const components: Array<Record<string, unknown>> = [{
+    type: 10,
+    content: `## ${snapshot.game.name}`,
+  }];
+  if (snapshot.game.coverUrl) {
+    components.push({
+      type: 9,
+      components: [{ type: 10, content: body.join("\n\n") }],
+      accessory: { type: 11, media: { url: snapshot.game.coverUrl } },
+    });
+  } else {
+    components.push({ type: 10, content: body.join("\n\n") });
+  }
+  components.push({
+    type: 1,
+    components: [{ type: 2, style: 2, label: "Manage my LFG", custom_id: `group:manage:${snapshot.game.id}` }],
+  });
+
   return {
-    embeds: [{
-      title: snapshot.game.name,
-      description: `**${snapshot.activeUserIds.length} in group**`,
-      fields,
-      thumbnail: snapshot.game.coverUrl ? { url: snapshot.game.coverUrl } : undefined,
-    }],
-    components: [{
-      type: 1,
-      components: [{ type: 2, style: 2, label: "Manage my LFG", custom_id: `group:manage:${snapshot.game.id}` }],
-    }],
+    flags: IS_COMPONENTS_V2,
+    embeds: [],
+    components: [{ type: 17, components }],
   };
 }
 
 function panelEligible(snapshot: GameGroupSnapshot): boolean {
   return snapshot.activeUserIds.length > 0 || Boolean(snapshot.upcomingEvent);
-}
-
-function embedValue(value: string): string {
-  return value.length <= 1024 ? value : `${value.slice(0, 1021)}…`;
 }
 
 async function createPanelMessage(
