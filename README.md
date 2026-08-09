@@ -39,11 +39,9 @@ no local Wrangler login.
 
 ## Commands
 
-- `/lfg Games [Duration]` adds or extends your membership in each selected
-  game's shared group. The default duration is two hours.
-- `/create Games When` creates an RSVP event. The creator starts as Yes. One
-  game has only RSVP buttons; multiple games also have a separate game-voting
-  select.
+- `/lfg Game [Duration]` adds or extends your membership in that game's shared
+  group. The default duration is two hours.
+- `/create Game When` creates an RSVP event. The creator starts as Yes.
 
 There is no separate listen/mute state. Your `/lfg` response is ephemeral and
 contains a blue **Pause** button and red **Stop** button for your membership.
