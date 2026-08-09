@@ -91,8 +91,13 @@ export class GameSelectionService {
     `).bind(gameId, guildId).first<Game>();
     if (!game) throw new Error("That custom game no longer exists.");
     if (!canManageGuild && game.createdByUserId !== actorId) throw new Error("You can only delete custom games you added.");
-    await this.db.prepare("UPDATE games SET deleted_at = ? WHERE id = ? AND guild_id = ?")
-      .bind(new Date().toISOString(), gameId, guildId).run();
+    const deletedAt = new Date().toISOString();
+    await this.db.batch([
+      this.db.prepare("UPDATE games SET deleted_at = ? WHERE id = ? AND guild_id = ?")
+        .bind(deletedAt, gameId, guildId),
+      this.db.prepare("DELETE FROM group_members WHERE group_id IN (SELECT id FROM game_groups WHERE guild_id = ? AND game_id = ?)")
+        .bind(guildId, gameId),
+    ]);
     return { game, collected: await collectDeletedCustomGame(this.db, gameId) };
   }
 
