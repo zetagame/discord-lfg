@@ -28,13 +28,11 @@ use `npx wrangler d1 migrations apply discord-lfg --remote`.
 
 ## Continuous integration and deployment
 
-Pull requests to `main` automatically run `npm run check` and `npm test`.
-Merges to `main` automatically apply remote D1 migrations, then deploy the
-Worker. The deployment can also be manually rerun with the GitHub Actions
-`workflow_dispatch` trigger.
+GitHub Actions is CI-only: pull requests to `main` automatically run `npm ci`,
+`npm run check`, and `npm test`. Production deployment is handled by Cloudflare
+Workers Builds connected directly to this GitHub repository.
 
-Set `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` as GitHub Actions
-secrets. Set `DISCORD_PUBLIC_KEY`, `DISCORD_BOT_TOKEN`, `IGDB_CLIENT_ID`, and
+Set `DISCORD_PUBLIC_KEY`, `DISCORD_BOT_TOKEN`, `IGDB_CLIENT_ID`, and
 `IGDB_CLIENT_SECRET` as Cloudflare Worker secrets. Routine deployments require
 no local Wrangler login.
 
