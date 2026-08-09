@@ -45,10 +45,10 @@ export function parseDuration(input: string | undefined, timeZone = DEFAULT_TIME
 export function parseWhen(input: string, timeZone: string, now = new Date()): Date | undefined {
   const value = input.trim().toLowerCase();
   if (value.startsWith("until ")) return parseUntil(value.slice(6).trim(), timeZone, now);
-  const date = /^\d{4}-\d{2}-\d{2}(?:[ t](\d{1,2})(?::(\d{2}))?)?$/.exec(value);
+  const date = /^\d{4}-\d{2}-\d{2}[ t](\d{1,2})(?::(\d{2}))?$/.exec(value);
   if (date) {
     const [year, month, day] = value.slice(0, 10).split("-").map(Number);
-    return zonedUtc(year!, month!, day!, Number(date[1] ?? 19), Number(date[2] ?? 0), timeZone);
+    return zonedUtc(year!, month!, day!, Number(date[1]), Number(date[2] ?? 0), timeZone);
   }
   return parseDuration(value, timeZone, now);
 }
@@ -59,7 +59,7 @@ function parseUntil(value: string, timeZone: string, now: Date): Date | undefine
     const target = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"].indexOf(weekday[1]!);
     const local = localParts(now, timeZone);
     const current = new Date(Date.UTC(local.year, local.month - 1, local.day));
-    current.setUTCDate(current.getUTCDate() + ((target - current.getUTCDay() + 7) % 7 || 7));
+    current.setUTCDate(current.getUTCDate() + (target - current.getUTCDay() + 7) % 7);
     return zonedUtc(current.getUTCFullYear(), current.getUTCMonth() + 1, current.getUTCDate(), 23, 59, timeZone);
   }
   const time = /^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/.exec(value);
@@ -92,4 +92,8 @@ function zonedUtc(year: number, month: number, day: number, hour: number, minute
 function localEndOfDay(value: Date, timeZone: string): Date {
   const local = localParts(value, timeZone);
   return zonedUtc(local.year, local.month, local.day, 23, 59, timeZone, 999);
+}
+
+export function discordTimestamp(date: Date): string {
+  return `<t:${Math.floor(date.getTime() / 1000)}:f>`;
 }
