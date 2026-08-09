@@ -121,22 +121,33 @@ export async function mutateLfg(
   const state = lfgState(lfg);
   if (state === "expired") throw new Error("This LFG window has already expired.");
   if (state === "stopped") throw new Error("This LFG has already stopped.");
-  if (action === "pause" && state !== "active") throw new Error("This LFG is already paused.");
-  if (action === "resume" && state !== "paused") throw new Error("This LFG is not paused.");
 
   const games = await loadLfgGames(db, lfgId);
   const gameIds = games.map((game) => game.id);
   const before = await activeUsersByGame(db, guildId, gameIds);
   const now = new Date().toISOString();
+  let update;
   if (action === "pause") {
-    await db.prepare("UPDATE lfgs SET paused_at = ? WHERE id = ? AND guild_id = ? AND stopped_at IS NULL")
-      .bind(now, lfgId, guildId).run();
+    update = await db.prepare(`
+      UPDATE lfgs SET paused_at = ?
+      WHERE id = ? AND guild_id = ? AND author_id = ? AND paused_at IS NULL AND stopped_at IS NULL
+        AND julianday(expires_at) > julianday('now')
+    `).bind(now, lfgId, guildId, actorId).run();
+    if (!update.meta.changes) throw new Error("This LFG is no longer active.");
   } else if (action === "resume") {
-    await db.prepare("UPDATE lfgs SET paused_at = NULL WHERE id = ? AND guild_id = ? AND stopped_at IS NULL")
-      .bind(lfgId, guildId).run();
+    update = await db.prepare(`
+      UPDATE lfgs SET paused_at = NULL
+      WHERE id = ? AND guild_id = ? AND author_id = ? AND paused_at IS NOT NULL AND stopped_at IS NULL
+        AND julianday(expires_at) > julianday('now')
+    `).bind(lfgId, guildId, actorId).run();
+    if (!update.meta.changes) throw new Error("This LFG is no longer paused.");
   } else {
-    await db.prepare("UPDATE lfgs SET stopped_at = ?, paused_at = NULL, finalized_at = ? WHERE id = ? AND guild_id = ? AND stopped_at IS NULL")
-      .bind(now, now, lfgId, guildId).run();
+    update = await db.prepare(`
+      UPDATE lfgs SET stopped_at = ?, paused_at = NULL, finalized_at = ?
+      WHERE id = ? AND guild_id = ? AND author_id = ? AND stopped_at IS NULL
+        AND julianday(expires_at) > julianday('now')
+    `).bind(now, now, lfgId, guildId, actorId).run();
+    if (!update.meta.changes) throw new Error("This LFG has already ended.");
   }
 
   const after = await activeUsersByGame(db, guildId, gameIds);
