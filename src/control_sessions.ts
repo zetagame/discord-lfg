@@ -6,7 +6,10 @@ export interface LfgControlReference {
 
 export interface PendingControlSession {
   nonce: string;
+  previous?: LfgControlReference;
 }
+
+const OPENING_LEASE_MS = 15_000;
 
 export async function beginControlSession(
   db: D1Database,
@@ -15,107 +18,98 @@ export async function beginControlSession(
   userId: string,
   applicationId: string,
   interactionToken: string,
-): Promise<PendingControlSession> {
+): Promise<PendingControlSession | undefined> {
   const nonce = crypto.randomUUID();
-  const now = new Date().toISOString();
-  await db.prepare(`
-    INSERT INTO lfg_control_sessions (
-      guild_id, game_id, user_id, nonce, application_id, interaction_token, message_id,
-      previous_application_id, previous_interaction_token, previous_message_id, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?)
-    ON CONFLICT(guild_id, game_id, user_id) DO UPDATE SET
-      previous_application_id = CASE
-        WHEN lfg_control_sessions.message_id IS NOT NULL THEN lfg_control_sessions.application_id
-        ELSE lfg_control_sessions.previous_application_id
-      END,
-      previous_interaction_token = CASE
-        WHEN lfg_control_sessions.message_id IS NOT NULL THEN lfg_control_sessions.interaction_token
-        ELSE lfg_control_sessions.previous_interaction_token
-      END,
-      previous_message_id = COALESCE(lfg_control_sessions.message_id, lfg_control_sessions.previous_message_id),
-      nonce = excluded.nonce,
-      application_id = excluded.application_id,
-      interaction_token = excluded.interaction_token,
-      message_id = NULL,
-      updated_at = excluded.updated_at
-  `).bind(guildId, gameId, userId, nonce, applicationId, interactionToken, now).run();
-  return { nonce };
-}
-
-export async function finalizeControlSession(
-  db: D1Database,
-  guildId: string,
-  gameId: string,
-  userId: string,
-  nonce: string,
-  messageId: string,
-): Promise<{ current: boolean; previous?: LfgControlReference }> {
+  const now = new Date();
+  const staleBefore = new Date(now.getTime() - OPENING_LEASE_MS).toISOString();
   const row = await db.prepare(`
-    UPDATE lfg_control_sessions
-    SET message_id = ?, updated_at = ?
-    WHERE guild_id = ? AND game_id = ? AND user_id = ? AND nonce = ?
-    RETURNING previous_application_id AS previousApplicationId,
-      previous_interaction_token AS previousInteractionToken,
-      previous_message_id AS previousMessageId
-  `).bind(messageId, new Date().toISOString(), guildId, gameId, userId, nonce).first<{
-    previousApplicationId?: string;
-    previousInteractionToken?: string;
-    previousMessageId?: string;
+    INSERT INTO lfg_control_sessions (
+      guild_id, game_id, user_id,
+      current_application_id, current_interaction_token, current_message_id,
+      opening_nonce, opening_application_id, opening_interaction_token, opening_started_at, updated_at
+    ) VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?)
+    ON CONFLICT(guild_id, game_id, user_id) DO UPDATE SET
+      opening_nonce = excluded.opening_nonce,
+      opening_application_id = excluded.opening_application_id,
+      opening_interaction_token = excluded.opening_interaction_token,
+      opening_started_at = excluded.opening_started_at,
+      updated_at = excluded.updated_at
+    WHERE lfg_control_sessions.opening_nonce IS NULL
+      OR lfg_control_sessions.opening_started_at IS NULL
+      OR lfg_control_sessions.opening_started_at <= ?
+    RETURNING current_application_id AS currentApplicationId,
+      current_interaction_token AS currentInteractionToken,
+      current_message_id AS currentMessageId
+  `).bind(
+    guildId,
+    gameId,
+    userId,
+    nonce,
+    applicationId,
+    interactionToken,
+    now.toISOString(),
+    now.toISOString(),
+    staleBefore,
+  ).first<{
+    currentApplicationId?: string;
+    currentInteractionToken?: string;
+    currentMessageId?: string;
   }>();
-  if (!row) return { current: false };
-  const previous = row.previousApplicationId && row.previousInteractionToken && row.previousMessageId
+  if (!row) return undefined;
+  const previous = row.currentApplicationId && row.currentInteractionToken && row.currentMessageId
     ? {
-      applicationId: row.previousApplicationId,
-      interactionToken: row.previousInteractionToken,
-      messageId: row.previousMessageId,
+      applicationId: row.currentApplicationId,
+      interactionToken: row.currentInteractionToken,
+      messageId: row.currentMessageId,
     }
     : undefined;
-  return { current: true, previous };
+  return { nonce, previous };
 }
 
-export async function abandonControlSession(
-  db: D1Database,
-  guildId: string,
-  gameId: string,
-  userId: string,
-  nonce: string,
-): Promise<void> {
-  const restored = await db.prepare(`
-    UPDATE lfg_control_sessions
-    SET application_id = previous_application_id,
-      interaction_token = previous_interaction_token,
-      message_id = previous_message_id,
-      previous_application_id = NULL,
-      previous_interaction_token = NULL,
-      previous_message_id = NULL,
-      updated_at = ?
-    WHERE guild_id = ? AND game_id = ? AND user_id = ? AND nonce = ?
-      AND previous_application_id IS NOT NULL
-      AND previous_interaction_token IS NOT NULL
-      AND previous_message_id IS NOT NULL
-  `).bind(new Date().toISOString(), guildId, gameId, userId, nonce).run();
-  if (restored.meta.changes) return;
-  await db.prepare(`
-    DELETE FROM lfg_control_sessions
-    WHERE guild_id = ? AND game_id = ? AND user_id = ? AND nonce = ?
-  `).bind(guildId, gameId, userId, nonce).run();
-}
-
-export async function clearPreviousControl(
+export async function promoteControlSession(
   db: D1Database,
   guildId: string,
   gameId: string,
   userId: string,
   nonce: string,
   messageId: string,
+): Promise<boolean> {
+  const result = await db.prepare(`
+    UPDATE lfg_control_sessions
+    SET current_application_id = opening_application_id,
+      current_interaction_token = opening_interaction_token,
+      current_message_id = ?,
+      opening_nonce = NULL,
+      opening_application_id = NULL,
+      opening_interaction_token = NULL,
+      opening_started_at = NULL,
+      updated_at = ?
+    WHERE guild_id = ? AND game_id = ? AND user_id = ? AND opening_nonce = ?
+  `).bind(messageId, new Date().toISOString(), guildId, gameId, userId, nonce).run();
+  return Boolean(result.meta.changes);
+}
+
+export async function cancelControlSessionOpening(
+  db: D1Database,
+  guildId: string,
+  gameId: string,
+  userId: string,
+  nonce: string,
 ): Promise<void> {
   await db.prepare(`
     UPDATE lfg_control_sessions
-    SET previous_application_id = NULL,
-      previous_interaction_token = NULL,
-      previous_message_id = NULL
-    WHERE guild_id = ? AND game_id = ? AND user_id = ? AND nonce = ? AND message_id = ?
-  `).bind(guildId, gameId, userId, nonce, messageId).run();
+    SET opening_nonce = NULL,
+      opening_application_id = NULL,
+      opening_interaction_token = NULL,
+      opening_started_at = NULL,
+      updated_at = ?
+    WHERE guild_id = ? AND game_id = ? AND user_id = ? AND opening_nonce = ?
+  `).bind(new Date().toISOString(), guildId, gameId, userId, nonce).run();
+  await db.prepare(`
+    DELETE FROM lfg_control_sessions
+    WHERE guild_id = ? AND game_id = ? AND user_id = ?
+      AND current_message_id IS NULL AND opening_nonce IS NULL
+  `).bind(guildId, gameId, userId).run();
 }
 
 export async function refreshControlSessionToken(
@@ -130,29 +124,29 @@ export async function refreshControlSessionToken(
   if (!messageId || !applicationId) return;
   await db.prepare(`
     UPDATE lfg_control_sessions
-    SET application_id = ?, interaction_token = ?, updated_at = ?
-    WHERE guild_id = ? AND game_id = ? AND user_id = ? AND message_id = ?
+    SET current_application_id = ?, current_interaction_token = ?, updated_at = ?
+    WHERE guild_id = ? AND game_id = ? AND user_id = ? AND current_message_id = ?
   `).bind(applicationId, interactionToken, new Date().toISOString(), guildId, gameId, userId, messageId).run();
 }
 
-export async function clearControlSession(
+export async function takeControlSession(
   db: D1Database,
   guildId: string,
   gameId: string,
   userId: string,
-  messageId?: string,
-): Promise<void> {
-  if (messageId) {
-    await db.prepare(`
-      DELETE FROM lfg_control_sessions
-      WHERE guild_id = ? AND game_id = ? AND user_id = ? AND message_id = ?
-    `).bind(guildId, gameId, userId, messageId).run();
-    return;
-  }
+): Promise<LfgControlReference | undefined> {
+  const row = await db.prepare(`
+    SELECT current_application_id AS applicationId,
+      current_interaction_token AS interactionToken,
+      current_message_id AS messageId
+    FROM lfg_control_sessions
+    WHERE guild_id = ? AND game_id = ? AND user_id = ?
+  `).bind(guildId, gameId, userId).first<LfgControlReference>();
   await db.prepare(`
     DELETE FROM lfg_control_sessions
     WHERE guild_id = ? AND game_id = ? AND user_id = ?
   `).bind(guildId, gameId, userId).run();
+  return row?.applicationId && row.interactionToken && row.messageId ? row : undefined;
 }
 
 export async function pruneControlSessions(db: D1Database): Promise<void> {
