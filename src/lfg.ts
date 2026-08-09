@@ -173,7 +173,7 @@ export async function refreshableLfgsForGames(db: D1Database, guildId: string, g
   return rows.results;
 }
 
-export async function claimExpiredLfgs(db: D1Database): Promise<Array<{ lfg: LfgRecord; gameIds: string[] }>> {
+export async function expiredUnfinalizedLfgs(db: D1Database): Promise<Array<{ lfg: LfgRecord; gameIds: string[] }>> {
   const rows = await db.prepare(`
     SELECT id, guild_id AS guildId, channel_id AS channelId, author_id AS authorId,
       expires_at AS expiresAt, paused_at AS pausedAt, stopped_at AS stoppedAt,
@@ -181,14 +181,15 @@ export async function claimExpiredLfgs(db: D1Database): Promise<Array<{ lfg: Lfg
     FROM lfgs
     WHERE stopped_at IS NULL AND finalized_at IS NULL AND julianday(expires_at) <= julianday('now')
   `).all<LfgRecord>();
-  const now = new Date().toISOString();
-  const claimed: Array<{ lfg: LfgRecord; gameIds: string[] }> = [];
+  const result: Array<{ lfg: LfgRecord; gameIds: string[] }> = [];
   for (const lfg of rows.results) {
-    const update = await db.prepare("UPDATE lfgs SET finalized_at = ? WHERE id = ? AND finalized_at IS NULL")
-      .bind(now, lfg.id).run();
-    if (!update.meta.changes) continue;
     const games = await loadLfgGames(db, lfg.id);
-    claimed.push({ lfg: { ...lfg, finalizedAt: now }, gameIds: games.map((game) => game.id) });
+    result.push({ lfg, gameIds: games.map((game) => game.id) });
   }
-  return claimed;
+  return result;
+}
+
+export async function markLfgFinalized(db: D1Database, lfgId: string): Promise<void> {
+  await db.prepare("UPDATE lfgs SET finalized_at = ? WHERE id = ? AND finalized_at IS NULL")
+    .bind(new Date().toISOString(), lfgId).run();
 }
