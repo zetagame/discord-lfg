@@ -75,13 +75,13 @@ function localParts(date: Date, timeZone: string) {
 }
 
 function zonedUtc(year: number, month: number, day: number, hour: number, minute: number, timeZone: string, milliseconds = 0): Date {
-  let timestamp = Date.UTC(year, month - 1, day, hour, minute, milliseconds);
+  let timestamp = Date.UTC(year, month - 1, day, hour, minute);
   for (let i = 0; i < 2; i++) {
     const parts = new Intl.DateTimeFormat("en-US", { timeZone, year: "numeric", month: "numeric", day: "numeric", hour: "numeric", hourCycle: "h23", minute: "numeric" }).formatToParts(new Date(timestamp));
     const get = (type: string) => Number(parts.find((part) => part.type === type)?.value);
-    timestamp += Date.UTC(year, month - 1, day, hour, minute, milliseconds) - Date.UTC(get("year"), get("month") - 1, get("day"), get("hour"), get("minute"));
+    timestamp += Date.UTC(year, month - 1, day, hour, minute) - Date.UTC(get("year"), get("month") - 1, get("day"), get("hour"), get("minute"));
   }
-  return new Date(timestamp);
+  return new Date(timestamp + (milliseconds ? 59_000 + milliseconds : 0));
 }
 
 function localEndOfDay(value: Date, timeZone: string): Date {
