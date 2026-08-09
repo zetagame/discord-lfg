@@ -281,14 +281,14 @@ export async function syncSharedGameGroups(env: Env): Promise<void> {
   for (const group of groups) await syncGamePanel(env, group.guildId, group.gameId, group.channelId);
 }
 
-export async function syncGamePanelsForEvent(env: Env, eventId: string): Promise<void> {
+export async function syncGamePanelsForEvent(env: Env, eventId: string, ensureGroups = true): Promise<void> {
   const rows = await env.DB.prepare(`
     SELECT events.guild_id AS guildId, events.channel_id AS channelId, event_games.game_id AS gameId
     FROM events JOIN event_games ON event_games.event_id = events.id
     WHERE events.id = ?
   `).bind(eventId).all<{ guildId: string; channelId: string; gameId: string }>();
   for (const row of rows.results) {
-    await ensureGameGroup(env.DB, row.guildId, row.gameId, row.channelId);
+    if (ensureGroups) await ensureGameGroup(env.DB, row.guildId, row.gameId, row.channelId);
     await syncGamePanel(env, row.guildId, row.gameId, row.channelId);
   }
 }
