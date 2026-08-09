@@ -1,12 +1,14 @@
 export interface Env {
   DB: D1Database;
   DISCORD_PUBLIC_KEY: string;
+  DISCORD_BOT_TOKEN?: string;
   IGDB_CLIENT_ID?: string;
   IGDB_CLIENT_SECRET?: string;
 }
 
 export interface DiscordInteraction {
   id: string;
+  application_id?: string;
   token: string;
   type: number;
   guild_id?: string;
@@ -32,4 +34,5 @@ export interface Game {
   id: string;
   name: string;
   providerId?: string;
+  coverUrl?: string;
 }
