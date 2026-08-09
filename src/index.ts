@@ -388,7 +388,7 @@ async function completeEventDelete(env: Env, i: DiscordInteraction, eventId: str
   if (!deleted) return;
 
   try {
-    await syncGamePanelsForEvent(env, eventId);
+    await syncGamePanelsForEvent(env, eventId, false);
   } catch (error) {
     console.error("Event panel sync after deletion failed", error);
   }
