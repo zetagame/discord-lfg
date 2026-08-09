@@ -36,7 +36,6 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/commands") return json(commands);
-    if (request.method === "GET" && url.pathname === "/register-commands") return registerCommands(env);
     if (request.method !== "POST") return new Response("Not found", { status: 404 });
 
     const interaction = await verifyDiscordRequest(request, env.DISCORD_PUBLIC_KEY);
@@ -58,21 +57,6 @@ export default {
     await collectDeletedCustomGames(env.DB);
   },
 } satisfies ExportedHandler<Env>;
-
-async function registerCommands(env: Env): Promise<Response> {
-  if (!env.DISCORD_BOT_TOKEN) return new Response("DISCORD_BOT_TOKEN is not configured.", { status: 500 });
-  const headers = { authorization: `Bot ${env.DISCORD_BOT_TOKEN}`, "content-type": "application/json" };
-  const appResponse = await fetch("https://discord.com/api/v10/oauth2/applications/@me", { headers });
-  if (!appResponse.ok) return new Response(`Could not identify Discord application (${appResponse.status}).`, { status: 502 });
-  const application = await appResponse.json() as { id: string };
-  const response = await fetch(`https://discord.com/api/v10/applications/${application.id}/commands`, {
-    method: "PUT",
-    headers,
-    body: JSON.stringify(commands),
-  });
-  if (!response.ok) return new Response(`Discord registration failed (${response.status}).`, { status: 502 });
-  return new Response("Registered /lfg and /create. This temporary endpoint can now be removed.");
-}
 
 async function autocomplete(interaction: DiscordInteraction, games: GameSelectionService): Promise<Response> {
   const focused = interaction.data?.options?.find((item) => item.focused);
