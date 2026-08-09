@@ -52,8 +52,9 @@ export async function actionAfter<T>(
       if (timeout) clearTimeout(timeout);
     }
 
-    if (attempt <= retries && lastError instanceof RetryableActionError && lastError.retryAfterMs > 0) {
-      await new Promise((resolve) => setTimeout(resolve, lastError.retryAfterMs));
+    const retryAfterMs = lastError instanceof RetryableActionError ? lastError.retryAfterMs : 0;
+    if (attempt <= retries && retryAfterMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, retryAfterMs));
     }
   }
 
