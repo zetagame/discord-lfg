@@ -102,6 +102,11 @@ export async function markMinimumPlayerAlerted(db: D1Database, eventId: string, 
     .bind(now.toISOString(), eventId).run();
 }
 
+export async function releaseMinimumPlayerCheck(_db: D1Database, _eventId: string): Promise<void> {
+  // The stored Yes-RSVP snapshot is the idempotency key for this check. Keep it
+  // across delivery failures so retries do not silently change the 30-minute observation.
+}
+
 export async function fireRsvpTrigger(db: D1Database, eventId: string, now = new Date()): Promise<boolean> {
   const trigger = await db.prepare("SELECT type, threshold, fired_at FROM event_triggers WHERE event_id = ?").bind(eventId)
     .first<{ type: string; threshold: number; fired_at?: string }>();
