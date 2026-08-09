@@ -36,7 +36,7 @@ export function parseDuration(input: string | undefined, timeZone = DEFAULT_TIME
     const local = localParts(now, timeZone);
     const localDate = new Date(Date.UTC(local.year, local.month - 1, local.day));
     const day = localDate.getUTCDay();
-    const days = day === 0 ? 0 : day === 6 ? 8 : 7 - day;
+    const days = day === 0 ? 0 : day === 6 ? 1 : 7 - day;
     return zonedUtc(local.year, local.month, local.day + days, 23, 59, timeZone, 999);
   }
   return undefined;

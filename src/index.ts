@@ -106,8 +106,8 @@ async function createEvent(i: DiscordInteraction, env: Env, games: Game[], actor
   if (!startsAt && !trigger) return message("Use a scheduled date/time, or a trigger such as \"3 yes RSVPs\".", true);
   const id = crypto.randomUUID();
   await env.DB.batch([
-    env.DB.prepare("INSERT INTO events (id, guild_id, channel_id, author_id, title, game_ids, starts_at, when_input) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-      .bind(id, i.guild_id, i.channel_id, actor, "Game night", JSON.stringify(games.map((game) => game.id)), startsAt?.toISOString() ?? null, whenInput),
+    env.DB.prepare("INSERT INTO events (id, guild_id, channel_id, author_id, title, starts_at, when_input) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .bind(id, i.guild_id, i.channel_id, actor, "Game night", startsAt?.toISOString() ?? null, whenInput),
     ...games.map((game) => env.DB.prepare("INSERT INTO event_games (event_id, game_id) VALUES (?, ?)").bind(id, game.id)),
     ...(trigger ? [env.DB.prepare("INSERT INTO event_triggers (event_id, type, threshold) VALUES (?, ?, ?)").bind(id, trigger.type, trigger.threshold)] : []),
   ]);
@@ -118,15 +118,21 @@ async function createEvent(i: DiscordInteraction, env: Env, games: Game[], actor
 }
 
 async function component(i: DiscordInteraction, env: Env): Promise<Response> {
-  const [action, eventId, status] = i.data?.custom_id?.split(":") ?? [];
-  if (action === "timezone" && status === "select") {
-    if (!i.guild_id || !userId(i)) return message("Invalid timezone selection context.", true);
-    const selected = canonicalTimeZone(i.data?.values?.[0]);
-    if (!selected) return message("Invalid timezone selection.", true);
-    await env.DB.prepare("UPDATE users SET timezone = ?, timezone_prompted_at = ? WHERE guild_id = ? AND user_id = ?")
-      .bind(selected, new Date().toISOString(), i.guild_id, userId(i)).run();
-    return message(`Timezone set to ${selected}.`, true);
+  const parts = i.data?.custom_id?.split(":") ?? [];
+  const action = parts[0];
+  if (action === "timezone") {
+    const sub = parts[1];
+    if (sub === "select") {
+      if (!i.guild_id || !userId(i)) return message("Invalid timezone selection context.", true);
+      const selected = canonicalTimeZone(i.data?.values?.[0]);
+      if (!selected) return message("Invalid timezone selection.", true);
+      await env.DB.prepare("UPDATE users SET timezone = ?, timezone_prompted_at = ? WHERE guild_id = ? AND user_id = ?")
+        .bind(selected, new Date().toISOString(), i.guild_id, userId(i)).run();
+      return message(`Timezone set to ${selected}.`, true);
+    }
+    return message("Invalid timezone action.", true);
   }
+  const [, eventId, status] = parts;
   if (!eventId) return message("Invalid event action.", true);
   const event = await env.DB.prepare("SELECT id FROM events WHERE id = ? AND guild_id = ?").bind(eventId, i.guild_id).first();
   if (!event) return message("This event is not available in this server.", true);

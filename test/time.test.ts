@@ -47,7 +47,7 @@ test("this weekend ends Sunday night in local timezone", () => {
   );
   assert.equal(
     parseDuration("this weekend", "America/New_York", new Date("2026-01-03T17:00:00.000Z"))?.toISOString(), // Saturday noon local
-    "2026-01-12T04:59:59.999Z",
+    "2026-01-05T04:59:59.999Z",
   );
   assert.equal(
     parseDuration("this weekend", "America/New_York", new Date("2026-01-04T17:00:00.000Z"))?.toISOString(), // Sunday noon local
