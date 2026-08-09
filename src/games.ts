@@ -1,6 +1,6 @@
 import type { Game } from "./types";
 
-const IGDB_TIMEOUT_MS = 1500;
+const IGDB_BUDGET_MS = 2200;
 
 export interface GameProvider {
   search(query: string): Promise<Game[]>;
@@ -12,44 +12,67 @@ export class IgdbProvider implements GameProvider {
 
   async search(query: string): Promise<Game[]> {
     if (!this.clientId || !this.clientSecret || !query.trim()) return [];
+    const deadline = Date.now() + IGDB_BUDGET_MS;
     try {
-      const access_token = await this.accessToken();
+      const access_token = await this.accessToken(deadline);
       if (!access_token) return [];
-      const response = await fetchWithTimeout("https://api.igdb.com/v4/games", {
-        method: "POST",
-        headers: {
-          "Client-ID": this.clientId,
-          Authorization: "Bearer " + access_token,
+      const result = await fetchJsonWithinBudget<Array<{ id: number; name: string; cover?: { url: string } }>>(
+        "https://api.igdb.com/v4/games",
+        {
+          method: "POST",
+          headers: {
+            "Client-ID": this.clientId,
+            Authorization: "Bearer " + access_token,
+          },
+          body: `search "${query.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"; fields id,name,cover.url; limit 20;`,
         },
-        body: `search "${query.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"; fields id,name,cover.url; limit 20;`,
-      });
-      if (!response.ok) return [];
-      const games = (await response.json()) as Array<{ id: number; name: string; cover?: { url: string } }>;
-      return games.map((game) => ({ id: `igdb:${game.id}`, name: game.name, providerId: String(game.id), coverUrl: game.cover?.url?.replace(/^\/\//, "https://") }));
+        deadline,
+      );
+      if (!result.response.ok || !result.body) return [];
+      return result.body.map((game) => ({
+        id: `igdb:${game.id}`,
+        name: game.name,
+        providerId: String(game.id),
+        coverUrl: game.cover?.url?.replace(/^\/\//, "https://"),
+      }));
     } catch {
       return [];
     }
   }
 
-  private async accessToken(): Promise<string | undefined> {
+  private async accessToken(deadline: number): Promise<string | undefined> {
     if (this.token && this.token.expiresAt > Date.now() + 60_000) return this.token.value;
-    const response = await fetchWithTimeout("https://id.twitch.tv/oauth2/token", {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ client_id: this.clientId!, client_secret: this.clientSecret!, grant_type: "client_credentials" }),
-    });
-    if (!response.ok) return undefined;
-    const token = await response.json() as { access_token: string; expires_in?: number };
-    this.token = { value: token.access_token, expiresAt: Date.now() + (token.expires_in ?? 3600) * 1000 };
-    return token.access_token;
+    const result = await fetchJsonWithinBudget<{ access_token: string; expires_in?: number }>(
+      "https://id.twitch.tv/oauth2/token",
+      {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ client_id: this.clientId!, client_secret: this.clientSecret!, grant_type: "client_credentials" }),
+      },
+      deadline,
+    );
+    if (!result.response.ok || !result.body) return undefined;
+    this.token = {
+      value: result.body.access_token,
+      expiresAt: Date.now() + (result.body.expires_in ?? 3600) * 1000,
+    };
+    return result.body.access_token;
   }
 }
 
-async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit): Promise<Response> {
+async function fetchJsonWithinBudget<T>(
+  input: RequestInfo | URL,
+  init: RequestInit,
+  deadline: number,
+): Promise<{ response: Response; body?: T }> {
+  const remainingMs = deadline - Date.now();
+  if (remainingMs <= 0) throw new Error("IGDB request budget exhausted");
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), IGDB_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), remainingMs);
   try {
-    return await fetch(input, { ...init, signal: controller.signal });
+    const response = await fetch(input, { ...init, signal: controller.signal });
+    if (!response.ok) return { response };
+    return { response, body: await response.json() as T };
   } finally {
     clearTimeout(timeout);
   }
