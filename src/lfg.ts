@@ -106,6 +106,7 @@ async function upcomingEventForGame(db: D1Database, guildId: string, gameId: str
     JOIN events ON events.id = event_games.event_id
     LEFT JOIN rsvps ON rsvps.event_id = events.id
     WHERE events.guild_id = ? AND event_games.game_id = ?
+      AND events.deleted_at IS NULL
       AND events.starts_at IS NOT NULL
       AND julianday(events.starts_at) > julianday('now')
       AND julianday(events.starts_at) <= julianday('now', '+1 hour')
@@ -307,7 +308,8 @@ export async function ensureGroupsForUpcomingEvents(db: D1Database): Promise<voi
       events.guild_id, event_games.game_id, events.channel_id
     FROM events
     JOIN event_games ON event_games.event_id = events.id
-    WHERE events.starts_at IS NOT NULL
+    WHERE events.deleted_at IS NULL
+      AND events.starts_at IS NOT NULL
       AND julianday(events.starts_at) > julianday('now')
       AND julianday(events.starts_at) <= julianday('now', '+1 hour')
   `).run();
