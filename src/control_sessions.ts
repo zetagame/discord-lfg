@@ -125,9 +125,11 @@ export async function clearControlSession(
 }
 
 export async function pruneControlSessions(db: D1Database): Promise<void> {
+  // Interaction tokens last 15 minutes. Stop treating a panel as closable before
+  // its stored token can expire; Pause/Resume refreshes this timestamp/token.
   await db.prepare(`
     DELETE FROM lfg_control_sessions
-    WHERE julianday(updated_at) <= julianday('now', '-20 minutes')
+    WHERE julianday(updated_at) <= julianday('now', '-14 minutes')
   `).run();
 }
 
