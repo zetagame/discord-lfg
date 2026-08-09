@@ -13,7 +13,7 @@ export interface DiscordInteraction {
   type: number;
   guild_id?: string;
   channel_id?: string;
-  member?: { user: { id: string; username: string } };
+  member?: { user: { id: string; username: string }; permissions?: string };
   user?: { id: string; username: string };
   data?: {
     name?: string;
@@ -35,4 +35,5 @@ export interface Game {
   name: string;
   providerId?: string;
   coverUrl?: string;
+  createdByUserId?: string;
 }
