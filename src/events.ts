@@ -16,11 +16,8 @@ export async function fireRsvpTrigger(db: D1Database, eventId: string, now = new
     .bind(eventId, ...statuses).first<{ count: number }>();
   if ((count?.count ?? 0) < trigger.threshold) return false;
   const firedAt = now.toISOString();
-  const result = await db.prepare(`
-    UPDATE event_triggers SET fired_at = ?
-    WHERE event_id = ? AND fired_at IS NULL
-      AND EXISTS (SELECT 1 FROM events WHERE events.id = event_triggers.event_id AND events.deleted_at IS NULL)
-  `).bind(firedAt, eventId).run();
+  const result = await db.prepare("UPDATE event_triggers SET fired_at = ? WHERE event_id = ? AND fired_at IS NULL AND EXISTS (SELECT 1 FROM events WHERE events.id = event_triggers.event_id AND events.deleted_at IS NULL)")
+    .bind(firedAt, eventId).run();
   if (!result.meta.changes) return false;
   await db.prepare("INSERT OR IGNORE INTO event_activations (event_id, activated_at) VALUES (?, ?)").bind(eventId, firedAt).run();
   return true;
