@@ -1,5 +1,6 @@
 import { collectDeletedCustomGames, IgdbProvider, GameSelectionService } from "./games";
 import {
+  activeUsersByGame,
   createLfg,
   expiredUnfinalizedLfgs,
   lfgSnapshot,
@@ -128,11 +129,12 @@ async function lfg(i: DiscordInteraction, env: Env, games: Game[], actor: string
     ? parseWhen(String(option(i, "duration")), userZone.timeZone)
     : new Date(Date.now() + 2 * 3_600_000);
   if (!duration) return message("Use a duration such as 30m, 2h, 3d, tonight, or this weekend.", true);
+  if (userZone.shouldPrompt) await markTimezonePrompted(env.DB, i.guild_id!, actor);
 
   const created = await createLfg(env.DB, i.guild_id!, i.channel_id!, actor, games, duration);
   const snapshot = await lfgSnapshot(env.DB, i.guild_id!, created.id);
   if (!snapshot) throw new Error("Could not create this LFG.");
-  ctx.waitUntil(afterLfgCreated(env, i, snapshot, created.newlyOverlappingGameIds, created.recipients));
+  ctx.waitUntil(afterLfgCreated(env, i, snapshot, created.newlyOverlappingGameIds, created.recipients, userZone.shouldPrompt));
   return json({ type: ResponseType.ChannelMessage, data: lfgMessageData(snapshot) });
 }
 
@@ -152,7 +154,7 @@ function lfgMessageData(snapshot: LfgSnapshot, loadingAction?: "pause" | "resume
       components: loadingAction
         ? [
           { type: 2, style: 1, label: `⏳ ${status}`, custom_id: `lfg:busy:${snapshot.lfg.id}`, disabled: true },
-          { type: 2, style: 4, label: "Stop", custom_id: `lfg:stop:${snapshot.lfg.id}`, disabled: true },
+          { type: 2, style: 4, label: "■ Stop", custom_id: `lfg:stop:${snapshot.lfg.id}`, disabled: true },
         ]
         : [
           state === "paused"
@@ -182,12 +184,21 @@ async function afterLfgCreated(
   snapshot: LfgSnapshot,
   newlyOverlappingGameIds: string[],
   recipients: string[],
+  shouldPromptTimezone: boolean,
 ): Promise<void> {
   await captureOriginalLfgMessage(env.DB, i, snapshot.lfg.id);
   const gameIds = snapshot.games.map((game) => game.id);
   await refreshLfgCardsForGames(env, snapshot.lfg.guildId, gameIds);
-  await notifyLfgOverlap(env, snapshot.lfg.channelId, snapshot.lfg.authorId, snapshot.games, newlyOverlappingGameIds, recipients);
-  await sendCustomGameControls(i, snapshot.games);
+  await notifyLfgOverlap(
+    env,
+    snapshot.lfg.guildId,
+    snapshot.lfg.channelId,
+    snapshot.lfg.authorId,
+    snapshot.games,
+    newlyOverlappingGameIds,
+    recipients,
+  );
+  await sendPostCommandControls(i, snapshot.games, shouldPromptTimezone);
 }
 
 async function captureOriginalLfgMessage(db: D1Database, i: DiscordInteraction, lfgId: string): Promise<void> {
@@ -208,6 +219,7 @@ async function captureOriginalLfgMessage(db: D1Database, i: DiscordInteraction, 
 
 async function notifyLfgOverlap(
   env: Env,
+  guildId: string,
   channelId: string,
   actor: string,
   games: Game[],
@@ -216,11 +228,11 @@ async function notifyLfgOverlap(
 ): Promise<void> {
   if (!gameIds.length || !recipients.length) return;
   const selected = games.filter((game) => gameIds.includes(game.id));
-  const active = await import("./lfg").then(({ activeUsersByGame }) => activeUsersByGame(env.DB, "", []));
-  void active;
+  const active = await activeUsersByGame(env.DB, guildId, gameIds);
   const mentions = recipients.map((uid) => `<@${uid}>`).join(" ");
+  const counts = selected.map((game) => `**${game.name}** — ${active.get(game.id)?.length ?? 0} available`).join("\n");
   await postChannelMessage(env, channelId, {
-    content: `${mentions} New overlap: <@${actor}> is available for **${gameNames(selected)}**.`,
+    content: `${mentions} New overlap with <@${actor}>:\n${counts}`,
     allowed_mentions: { users: recipients },
   });
 }
@@ -259,6 +271,7 @@ async function completeLfgAction(
     if (action === "resume") {
       await notifyLfgOverlap(
         env,
+        result.snapshot.lfg.guildId,
         result.snapshot.lfg.channelId,
         actor,
         result.snapshot.games,
@@ -267,7 +280,7 @@ async function completeLfgAction(
       );
     }
     if (action === "stop") await collectDeletedCustomGames(env.DB);
-    if (!edited) await interactionFollowup(i, "The LFG state changed, but Discord did not refresh the card. Try the button again in a moment.");
+    if (!edited) await interactionFollowup(i, "The LFG state changed, but Discord did not refresh the card. Try again in a moment.");
   } catch (error) {
     const latest = await lfgSnapshot(env.DB, i.guild_id!, lfgId);
     if (latest && messageId) await editChannelMessage(env, latest.lfg.channelId, messageId, lfgMessageData(latest));
@@ -315,6 +328,7 @@ async function createEvent(i: DiscordInteraction, env: Env, games: Game[], actor
   const startsAt = parseWhen(whenInput, userZone.timeZone);
   const trigger = parseTrigger(whenInput);
   if (!startsAt && !trigger) return message("Use a scheduled date/time, or a trigger such as \"3 yes RSVPs\".", true);
+  if (userZone.shouldPrompt) await markTimezonePrompted(env.DB, i.guild_id!, actor);
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
   await env.DB.batch([
@@ -326,7 +340,7 @@ async function createEvent(i: DiscordInteraction, env: Env, games: Game[], actor
   ]);
   if (trigger && await fireRsvpTrigger(env.DB, id)) ctx.waitUntil(notifyActivation(env, id));
   const data = await eventMessageData(env.DB, id, i.guild_id!);
-  ctx.waitUntil(sendCustomGameControls(i, games));
+  ctx.waitUntil(sendPostCommandControls(i, games, userZone.shouldPrompt));
   return json({ type: ResponseType.ChannelMessage, data });
 }
 
@@ -391,6 +405,10 @@ function eventComponents(eventId: string, games: Game[]): unknown[] {
   return components;
 }
 
+function timezoneComponent(): unknown {
+  return { type: 1, components: [{ type: 3, custom_id: "timezone:select", placeholder: "Optional: set your timezone", min_values: 1, max_values: 1, options: timezoneOptions }] };
+}
+
 function customGameDeleteComponents(i: DiscordInteraction, games: Game[], maxRows = 5): unknown[] {
   const actor = userId(i);
   if (!actor) return [];
@@ -411,27 +429,19 @@ function customGameDeleteComponents(i: DiscordInteraction, games: Game[], maxRow
   return rows;
 }
 
-async function sendCustomGameControls(i: DiscordInteraction, games: Game[]): Promise<void> {
+async function sendPostCommandControls(i: DiscordInteraction, games: Game[], shouldPromptTimezone: boolean): Promise<void> {
   if (!i.application_id) return;
-  const components = customGameDeleteComponents(i, games);
+  const components = [
+    ...(shouldPromptTimezone ? [timezoneComponent()] : []),
+    ...customGameDeleteComponents(i, games, shouldPromptTimezone ? 4 : 5),
+  ];
   if (!components.length) return;
   const response = await fetch(`https://discord.com/api/v10/webhooks/${i.application_id}/${i.token}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ content: "Custom games", flags: 64, components }),
+    body: JSON.stringify({ content: shouldPromptTimezone ? "Optional settings" : "Custom games", flags: 64, components }),
   });
-  if (!response.ok) console.error("Discord custom game controls failed", response.status, await response.text());
-}
-
-async function eventAcceptsChanges(db: D1Database, eventId: string): Promise<boolean> {
-  const event = await db.prepare(`
-    SELECT events.starts_at, event_triggers.fired_at
-    FROM events LEFT JOIN event_triggers ON event_triggers.event_id = events.id
-    WHERE events.id = ?
-  `).bind(eventId).first<{ starts_at?: string; fired_at?: string }>();
-  if (!event) return false;
-  if (event.starts_at) return new Date(event.starts_at).getTime() > Date.now();
-  return !event.fired_at;
+  if (!response.ok) console.error("Discord post-command controls failed", response.status, await response.text());
 }
 
 async function component(i: DiscordInteraction, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -510,6 +520,17 @@ async function component(i: DiscordInteraction, env: Env, ctx: ExecutionContext)
   return message("Invalid event action.", true);
 }
 
+async function eventAcceptsChanges(db: D1Database, eventId: string): Promise<boolean> {
+  const event = await db.prepare(`
+    SELECT events.starts_at, event_triggers.fired_at
+    FROM events LEFT JOIN event_triggers ON event_triggers.event_id = events.id
+    WHERE events.id = ?
+  `).bind(eventId).first<{ starts_at?: string; fired_at?: string }>();
+  if (!event) return false;
+  if (event.starts_at) return new Date(event.starts_at).getTime() > Date.now();
+  return !event.fired_at;
+}
+
 async function userTimeZone(db: D1Database, guildId: string, userIdValue: string): Promise<{ timeZone: string; shouldPrompt: boolean }> {
   const user = await db.prepare("SELECT timezone, timezone_prompted_at FROM users WHERE guild_id = ? AND user_id = ?")
     .bind(guildId, userIdValue).first<{ timezone?: string; timezone_prompted_at?: string }>();
@@ -518,8 +539,14 @@ async function userTimeZone(db: D1Database, guildId: string, userIdValue: string
   return { timeZone: effectiveTimeZone(user?.timezone), shouldPrompt };
 }
 
+async function markTimezonePrompted(db: D1Database, guildId: string, userIdValue: string): Promise<void> {
+  await db.prepare(
+    "INSERT INTO users (guild_id, user_id, timezone_prompted_at) VALUES (?, ?, ?) ON CONFLICT(guild_id, user_id) DO UPDATE SET timezone_prompted_at = excluded.timezone_prompted_at",
+  ).bind(guildId, userIdValue, new Date().toISOString()).run();
+}
+
 function parseTrigger(value: string): { type: string; threshold: number } | undefined {
-  const match = /^(\d+)\s+(people online|listeners online|yes rsvps|yes-or-maybe rsvps)$/i.exec(value.trim());
+  const match = /^(\d+)\s+(people online|yes rsvps|yes-or-maybe rsvps)$/i.exec(value.trim());
   return match ? { threshold: Number(match[1]), type: match[2].toLowerCase().replaceAll(" ", "_") } : undefined;
 }
 
