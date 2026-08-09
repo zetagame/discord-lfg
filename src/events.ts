@@ -70,7 +70,7 @@ export async function claimMinimumPlayerCheck(
   now = new Date(),
 ): Promise<number | undefined> {
   const nowIso = now.toISOString();
-  const result = await db.prepare(`
+  await db.prepare(`
     INSERT OR IGNORE INTO event_min_player_checks (event_id, checked_at, yes_count)
     SELECT events.id, ?, (
       SELECT COUNT(*) FROM rsvps WHERE rsvps.event_id = events.id AND rsvps.status = 'yes'
@@ -83,20 +83,23 @@ export async function claimMinimumPlayerCheck(
       AND julianday(events.starts_at) > julianday(?)
       AND julianday(events.starts_at) <= julianday(?, '+30 minutes')
   `).bind(nowIso, eventId, nowIso, nowIso).run();
-  if (!result.meta.changes) return undefined;
-  const check = await db.prepare("SELECT yes_count AS yesCount FROM event_min_player_checks WHERE event_id = ?")
-    .bind(eventId).first<{ yesCount: number }>();
-  return check?.yesCount;
+
+  const check = await db.prepare(`
+    SELECT event_min_player_checks.yes_count AS yesCount,
+      event_min_player_checks.alerted_at AS alertedAt
+    FROM event_min_player_checks
+    JOIN events ON events.id = event_min_player_checks.event_id
+    WHERE event_min_player_checks.event_id = ?
+      AND events.deleted_at IS NULL
+      AND events.starts_at IS NOT NULL
+      AND julianday(events.starts_at) > julianday(?)
+  `).bind(eventId, nowIso).first<{ yesCount: number; alertedAt?: string }>();
+  return check && !check.alertedAt ? check.yesCount : undefined;
 }
 
 export async function markMinimumPlayerAlerted(db: D1Database, eventId: string, now = new Date()): Promise<void> {
-  await db.prepare("UPDATE event_min_player_checks SET alerted_at = ? WHERE event_id = ?")
+  await db.prepare("UPDATE event_min_player_checks SET alerted_at = ? WHERE event_id = ? AND alerted_at IS NULL")
     .bind(now.toISOString(), eventId).run();
-}
-
-export async function releaseMinimumPlayerCheck(db: D1Database, eventId: string): Promise<void> {
-  await db.prepare("DELETE FROM event_min_player_checks WHERE event_id = ? AND alerted_at IS NULL")
-    .bind(eventId).run();
 }
 
 export async function fireRsvpTrigger(db: D1Database, eventId: string, now = new Date()): Promise<boolean> {
