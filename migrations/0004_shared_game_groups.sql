@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS game_groups (
   channel_id TEXT,
   discord_message_id TEXT,
   panel_claim_token TEXT,
+  panel_claimed_at TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE (guild_id, game_id)
 );
