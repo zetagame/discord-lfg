@@ -20,6 +20,7 @@ import {
   type GroupMember,
   type MembershipUpdate,
 } from "./lfg";
+import { reconcileLegacyLfgs } from "./legacy_lfg";
 import { ResponseType, json, userId } from "./discord";
 import { discordTimestamp } from "./time";
 import type { DiscordInteraction, Env, Game } from "./types";
@@ -34,6 +35,7 @@ export async function handleLfgCommand(
   expiresAt: Date,
   ctx: ExecutionContext,
 ): Promise<Response> {
+  await reconcileLegacyLfgs(env.DB);
   const updates: MembershipUpdate[] = [];
   for (const game of games) {
     updates.push(await upsertGameMembership(env.DB, i.guild_id!, i.channel_id!, actor, game, expiresAt));
@@ -215,6 +217,7 @@ export async function syncGamePanel(env: Env, guildId: string, gameId: string, p
 }
 
 export async function syncSharedGameGroups(env: Env): Promise<void> {
+  await reconcileLegacyLfgs(env.DB);
   await pruneExpiredGroupMembers(env.DB);
   await ensureGroupsForUpcomingEvents(env.DB);
   await retireLegacyLfgCards(env);
