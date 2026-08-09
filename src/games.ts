@@ -1,5 +1,7 @@
 import type { Env, Game } from "./types";
 
+const IGDB_TIMEOUT_MS = 1500;
+
 export interface GameProvider {
   search(query: string): Promise<Game[]>;
 }
@@ -10,24 +12,28 @@ export class IgdbProvider implements GameProvider {
 
   async search(query: string): Promise<Game[]> {
     if (!this.clientId || !this.clientSecret || !query.trim()) return [];
-    const access_token = await this.accessToken();
-    if (!access_token) return [];
-    const response = await fetch("https://api.igdb.com/v4/games", {
-      method: "POST",
-      headers: {
-        "Client-ID": this.clientId,
-        Authorization: "Bearer " + access_token,
-      },
-      body: `search "${query.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"; fields id,name,cover.url; limit 20;`,
-    });
-    if (!response.ok) return [];
-    const games = (await response.json()) as Array<{ id: number; name: string; cover?: { url: string } }>;
-    return games.map((game) => ({ id: `igdb:${game.id}`, name: game.name, providerId: String(game.id), coverUrl: game.cover?.url?.replace(/^\/\//, "https://") }));
+    try {
+      const access_token = await this.accessToken();
+      if (!access_token) return [];
+      const response = await fetchWithTimeout("https://api.igdb.com/v4/games", {
+        method: "POST",
+        headers: {
+          "Client-ID": this.clientId,
+          Authorization: "Bearer " + access_token,
+        },
+        body: `search "${query.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"; fields id,name,cover.url; limit 20;`,
+      });
+      if (!response.ok) return [];
+      const games = (await response.json()) as Array<{ id: number; name: string; cover?: { url: string } }>;
+      return games.map((game) => ({ id: `igdb:${game.id}`, name: game.name, providerId: String(game.id), coverUrl: game.cover?.url?.replace(/^\/\//, "https://") }));
+    } catch {
+      return [];
+    }
   }
 
   private async accessToken(): Promise<string | undefined> {
     if (this.token && this.token.expiresAt > Date.now() + 60_000) return this.token.value;
-    const response = await fetch("https://id.twitch.tv/oauth2/token", {
+    const response = await fetchWithTimeout("https://id.twitch.tv/oauth2/token", {
       method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({ client_id: this.clientId!, client_secret: this.clientSecret!, grant_type: "client_credentials" }),
     });
@@ -35,6 +41,16 @@ export class IgdbProvider implements GameProvider {
     const token = await response.json() as { access_token: string; expires_in?: number };
     this.token = { value: token.access_token, expiresAt: Date.now() + (token.expires_in ?? 3600) * 1000 };
     return token.access_token;
+  }
+}
+
+async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), IGDB_TIMEOUT_MS);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
