@@ -1,6 +1,7 @@
 export interface Env {
   DB: D1Database;
   DISCORD_PUBLIC_KEY: string;
+  DISCORD_BOT_TOKEN?: string;
   IGDB_CLIENT_ID?: string;
   IGDB_CLIENT_SECRET?: string;
 }

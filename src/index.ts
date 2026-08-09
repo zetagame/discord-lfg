@@ -2,6 +2,7 @@ import { IgdbProvider, GameSelectionService } from "./games";
 import { matchingListeners, recordNotificationAction } from "./notifications";
 import { InteractionType, ResponseType, json, option, userId, verifyDiscordRequest } from "./discord";
 import { effectiveTimeZone, parseDuration, parseWhen } from "./time";
+import { dueDeliveries, fireRsvpTrigger } from "./events";
 import type { DiscordInteraction, Env, Game } from "./types";
 
 const gameOption = { name: "games", description: "Games", type: 3, required: true, autocomplete: true };
@@ -27,6 +28,9 @@ export default {
     if (interaction.type === InteractionType.Component) return component(interaction, env);
     if (interaction.type === InteractionType.ApplicationCommand) return command(interaction, env, games);
     return message("Unsupported interaction.", true);
+  },
+  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+    await sendScheduledNotifications(env);
   },
 } satisfies ExportedHandler<Env>;
 
@@ -58,7 +62,8 @@ async function command(i: DiscordInteraction, env: Env, games: GameSelectionServ
 }
 
 async function listen(i: DiscordInteraction, env: Env, games: Game[], action: "listen" | "unlisten"): Promise<Response> {
-  const duration = parseDuration(String(option(i, "duration") ?? ""));
+  const timeZone = await userTimeZone(env.DB, i.guild_id!, userId(i)!);
+  const duration = parseDuration(String(option(i, "duration") ?? ""), timeZone);
   if (option(i, "duration") && !duration) return message("Use a duration such as 30m, 2h, 3d, tonight, or this weekend.", true);
   await recordNotificationAction(env.DB, i.guild_id!, userId(i)!, games.map((game) => game.id), action, duration);
   const word = action === "listen" ? "Listening for" : "Not listening for";
@@ -66,7 +71,8 @@ async function listen(i: DiscordInteraction, env: Env, games: Game[], action: "l
 }
 
 async function lfg(i: DiscordInteraction, env: Env, games: Game[]): Promise<Response> {
-  const duration = option(i, "duration") ? parseDuration(String(option(i, "duration"))) : new Date(Date.now() + 2 * 3_600_000);
+  const timeZone = await userTimeZone(env.DB, i.guild_id!, userId(i)!);
+  const duration = option(i, "duration") ? parseDuration(String(option(i, "duration")), timeZone) : new Date(Date.now() + 2 * 3_600_000);
   if (!duration) return message("Use a duration such as 30m, 2h, 3d, tonight, or this weekend.", true);
   const id = crypto.randomUUID();
   await env.DB.batch([
@@ -87,7 +93,7 @@ async function createEvent(i: DiscordInteraction, env: Env, games: Game[], actor
   const id = crypto.randomUUID();
   await env.DB.batch([
     env.DB.prepare("INSERT INTO events (id, guild_id, channel_id, author_id, title, game_ids, starts_at, when_input) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-      .bind(id, i.guild_id, i.channel_id, actor, "Game night", JSON.stringify(games.map((game) => game.id)), (startsAt ?? new Date()).toISOString(), whenInput),
+      .bind(id, i.guild_id, i.channel_id, actor, "Game night", JSON.stringify(games.map((game) => game.id)), startsAt?.toISOString() ?? null, whenInput),
     ...games.map((game) => env.DB.prepare("INSERT INTO event_games (event_id, game_id) VALUES (?, ?)").bind(id, game.id)),
     ...(trigger ? [env.DB.prepare("INSERT INTO event_triggers (event_id, type, threshold) VALUES (?, ?, ?)").bind(id, trigger.type, trigger.threshold)] : []),
   ]);
@@ -104,19 +110,8 @@ async function component(i: DiscordInteraction, env: Env): Promise<Response> {
   if (action === "rsvp" && ["yes", "maybe", "no"].includes(status ?? "")) {
     await env.DB.prepare("INSERT INTO rsvps (event_id, user_id, status, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(event_id, user_id) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at")
       .bind(eventId, userId(i), status, new Date().toISOString()).run();
-    await fireRsvpTrigger(env.DB, eventId);
+    if (await fireRsvpTrigger(env.DB, eventId)) await notifyActivation(env, eventId);
     return message(`RSVP updated to ${status}.`, true);
-  }
-
-  async function fireRsvpTrigger(db: D1Database, eventId: string): Promise<void> {
-    const trigger = await db.prepare("SELECT type, threshold, fired_at FROM event_triggers WHERE event_id = ?").bind(eventId)
-      .first<{ type: string; threshold: number; fired_at?: string }>();
-    if (!trigger || trigger.fired_at || !["yes_rsvps", "yes-or-maybe_rsvps"].includes(trigger.type)) return;
-    const statuses = trigger.type === "yes_rsvps" ? ["yes"] : ["yes", "maybe"];
-    const count = await db.prepare(`SELECT COUNT(*) AS count FROM rsvps WHERE event_id = ? AND status IN (${statuses.map(() => "?").join(",")})`)
-      .bind(eventId, ...statuses).first<{ count: number }>();
-    if ((count?.count ?? 0) >= trigger.threshold) await db.prepare("UPDATE event_triggers SET fired_at = ? WHERE event_id = ? AND fired_at IS NULL")
-      .bind(new Date().toISOString(), eventId).run();
   }
   if (action === "vote") {
     const values = i.data?.values ?? [];
@@ -137,6 +132,45 @@ async function userTimeZone(db: D1Database, guildId: string, userId: string): Pr
 function parseTrigger(value: string): { type: string; threshold: number } | undefined {
   const match = /^(\d+)\s+(people online|listeners online|yes rsvps|yes-or-maybe rsvps)$/i.exec(value.trim());
   return match ? { threshold: Number(match[1]), type: match[2].toLowerCase().replaceAll(" ", "_") } : undefined;
+}
+
+async function sendScheduledNotifications(env: Env, now = new Date()): Promise<void> {
+  const events = await env.DB.prepare(`
+    SELECT events.id, events.channel_id, events.title, events.starts_at, rsvps.user_id, rsvps.status
+    FROM events JOIN rsvps ON rsvps.event_id = events.id
+    WHERE events.starts_at IS NOT NULL AND events.starts_at <= ?
+  `).bind(new Date(now.getTime() + 3_600_000).toISOString()).all<{
+    id: string; channel_id: string; title: string; starts_at: string; user_id: string; status: "yes" | "maybe" | "no";
+  }>();
+  for (const event of events.results) {
+    for (const kind of dueDeliveries(new Date(event.starts_at), event.status, now)) {
+      const content = kind === "reminder"
+        ? `<@${event.user_id}> Reminder: **${event.title}** starts in about an hour.`
+        : `<@${event.user_id}> **${event.title}** is starting now.`;
+      await deliver(env, event.id, event.user_id, kind, event.channel_id, content);
+    }
+  }
+}
+
+async function notifyActivation(env: Env, eventId: string): Promise<void> {
+  const event = await env.DB.prepare("SELECT channel_id, title FROM events WHERE id = ?").bind(eventId)
+    .first<{ channel_id: string; title: string }>();
+  if (event) await deliver(env, eventId, "", "activation", event.channel_id, `**${event.title}** is now active.`);
+}
+
+async function deliver(env: Env, eventId: string, userId: string, kind: "reminder" | "start" | "activation", channelId: string, content: string): Promise<void> {
+  if (!env.DISCORD_BOT_TOKEN) return;
+  const existing = await env.DB.prepare("SELECT 1 FROM event_deliveries WHERE event_id = ? AND user_id = ? AND kind = ?")
+    .bind(eventId, userId, kind).first();
+  if (existing) return;
+  const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
+    method: "POST",
+    headers: { authorization: `Bot ${env.DISCORD_BOT_TOKEN}`, "content-type": "application/json" },
+    body: JSON.stringify({ content }),
+  });
+  if (!response.ok) return;
+  await env.DB.prepare("INSERT OR IGNORE INTO event_deliveries (event_id, user_id, kind, delivered_at) VALUES (?, ?, ?, ?)")
+    .bind(eventId, userId, kind, new Date().toISOString()).run();
 }
 function message(content: string, ephemeral: boolean): Response { return json({ type: ResponseType.ChannelMessage, data: { content, flags: ephemeral ? 64 : undefined } }); }
 function publicEmbed(title: string, description: string): Response { return json({ type: ResponseType.ChannelMessage, data: { embeds: [{ title, description }] } }); }
