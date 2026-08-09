@@ -4,39 +4,7 @@ export const InteractionType = { Ping: 1, ApplicationCommand: 2, Component: 3, A
 export const ResponseType = { Pong: 1, ChannelMessage: 4, Autocomplete: 8, UpdateMessage: 7, Modal: 9 } as const;
 
 export function json(body: unknown): Response {
-  return new Response(JSON.stringify(chainAutocompleteChoices(body)), { headers: { "content-type": "application/json" } });
-}
-
-/**
- * The bot currently has one autocomplete surface: the comma-delimited game
- * field shared by /lfg and /create. The visible choice text must carry the same
- * accumulated value as the submitted choice; otherwise Discord shows only the
- * current game's label and selecting it does not leave the comma in the field.
- */
-export function chainAutocompleteChoices(body: unknown): unknown {
-  if (!isAutocompleteResponse(body)) return body;
-  return {
-    ...body,
-    data: {
-      ...body.data,
-      choices: body.data.choices.map((choice) => {
-        if (typeof choice.value !== "string") return choice;
-        const chained = choice.value.endsWith(", ")
-          ? choice.value
-          : choice.value.length <= 98 ? `${choice.value}, ` : choice.value;
-        return { ...choice, name: chained, value: chained };
-      }),
-    },
-  };
-}
-
-function isAutocompleteResponse(body: unknown): body is {
-  type: number;
-  data: { choices: Array<{ name: string; value: string | number }> };
-} {
-  if (!body || typeof body !== "object") return false;
-  const candidate = body as { type?: unknown; data?: { choices?: unknown } };
-  return candidate.type === ResponseType.Autocomplete && Array.isArray(candidate.data?.choices);
+  return new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
 }
 
 export async function verifyDiscordRequest(request: Request, publicKey: string): Promise<DiscordInteraction | null> {
