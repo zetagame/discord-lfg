@@ -1,3 +1,5 @@
+import type { Game } from "./types";
+
 export type NotificationAction = "listen" | "unlisten";
 export interface NotificationInstruction { action: NotificationAction; createdAt: Date; expiresAt?: Date; }
 
@@ -14,6 +16,34 @@ export async function recordNotificationAction(
   await db.batch(gameIds.map((gameId) => db.prepare(
     "INSERT INTO notification_actions (id, guild_id, user_id, game_id, action, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
   ).bind(crypto.randomUUID(), guildId, userId, gameId, action, createdAt, expiresAt?.toISOString() ?? null)));
+}
+
+export async function currentListenedGames(db: D1Database, guildId: string, userId: string, query = ""): Promise<Game[]> {
+  const result = await db.prepare(`
+    SELECT notification_actions.id, notification_actions.game_id, notification_actions.action, notification_actions.created_at,
+      games.name, games.provider_id AS providerId, games.cover_url AS coverUrl
+    FROM notification_actions
+    JOIN games ON games.id = notification_actions.game_id
+    WHERE notification_actions.guild_id = ? AND notification_actions.user_id = ?
+      AND (notification_actions.expires_at IS NULL OR julianday(notification_actions.expires_at) > julianday('now'))
+      AND games.name LIKE ?
+    ORDER BY notification_actions.created_at DESC, notification_actions.id DESC
+  `).bind(guildId, userId, `%${query}%`).all<{
+    id: string;
+    game_id: string;
+    action: NotificationAction;
+    created_at: string;
+    name: string;
+    providerId?: string;
+    coverUrl?: string;
+  }>();
+  const latest = new Map<string, (typeof result.results)[number]>();
+  for (const row of result.results) {
+    if (!latest.has(row.game_id)) latest.set(row.game_id, row);
+  }
+  return [...latest.values()]
+    .filter((row) => row.action === "listen")
+    .map((row) => ({ id: row.game_id, name: row.name, providerId: row.providerId, coverUrl: row.coverUrl }));
 }
 
 export async function matchingListeners(db: D1Database, guildId: string, gameIds: string[], excludedUserId: string): Promise<string[]> {
