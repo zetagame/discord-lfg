@@ -75,7 +75,6 @@ export class GameSelectionService {
   async resolve(guildId: string, input: string, createdByUserId?: string): Promise<Game[]> {
     const name = input.trim();
     if (!name) throw new Error("Choose a game.");
-    if (name.includes(",")) throw new Error("Choose one game.");
     return [await this.resolveOne(guildId, name, createdByUserId)];
   }
 
