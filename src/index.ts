@@ -366,26 +366,41 @@ async function component(i: DiscordInteraction, env: Env, ctx: ExecutionContext)
 }
 
 async function completeEventDelete(env: Env, i: DiscordInteraction, eventId: string, channelId: string): Promise<void> {
+  let deleted = false;
   try {
     const result = await env.DB.prepare(`
       UPDATE events SET deleted_at = ?
       WHERE id = ? AND guild_id = ? AND deleted_at IS NULL
     `).bind(new Date().toISOString(), eventId, i.guild_id).run();
-    if (!result.meta.changes) return;
-    await syncGamePanelsForEvent(env, eventId);
-    await collectDeletedCustomGames(env.DB);
-    if (i.message?.id && await deleteDiscordMessage(env, channelId, i.message.id)) return;
-    if (i.message?.id) await editDiscordMessage(env, channelId, i.message.id, { content: "Event deleted.", embeds: [], components: [] });
+    deleted = Boolean(result.meta.changes);
   } catch (error) {
-    console.error("Event deletion failed", error);
+    console.error("Event deletion mutation failed", error);
     if (i.message?.id && i.guild_id) {
       try {
         await editDiscordMessage(env, channelId, i.message.id, await eventMessageData(env.DB, eventId, i.guild_id));
       } catch {
-        // The event may already be deleted; there is nothing safe to restore.
+        // Nothing safe to restore.
       }
     }
     await interactionFollowup(i, error instanceof Error ? error.message : "Could not delete that event.");
+    return;
+  }
+  if (!deleted) return;
+
+  try {
+    await syncGamePanelsForEvent(env, eventId);
+  } catch (error) {
+    console.error("Event panel sync after deletion failed", error);
+  }
+  try {
+    await collectDeletedCustomGames(env.DB);
+  } catch (error) {
+    console.error("Custom-game collection after event deletion failed", error);
+  }
+
+  if (i.message?.id && await deleteDiscordMessage(env, channelId, i.message.id)) return;
+  if (i.message?.id) {
+    await editDiscordMessage(env, channelId, i.message.id, { content: "Event deleted.", embeds: [], components: [] });
   }
 }
 
