@@ -23,6 +23,8 @@ import { ResponseType, json, userId } from "./discord";
 import { discordTimestamp } from "./time";
 import type { DiscordInteraction, Env, Game } from "./types";
 
+const ANY_GAME_PROVIDER_ID = "system:any";
+
 export { syncGamePanelsForEvent, syncSharedGameGroups } from "./panel_sync";
 
 export async function handleLfgCommand(
@@ -92,12 +94,21 @@ export async function handleGroupComponent(i: DiscordInteraction, env: Env, ctx:
   const state = groupMemberState(member);
 
   if (action === "manage") {
-    if (state === "missing" || state === "expired") return ephemeral(`You're not currently in **${snapshot.game.name}**. Use /lfg to join or extend the group.`);
+    let controlGame = snapshot.game;
+    let controlMember = member;
+    let controlGameId = gameId;
+    if (state === "missing" || state === "expired") {
+      const wildcard = await activeAnyMembership(env.DB, i.guild_id, actor);
+      if (!wildcard) return ephemeral(`You're not currently in **${snapshot.game.name}**. Use /lfg to join or extend the group.`);
+      controlGame = wildcard.game;
+      controlMember = wildcard.member;
+      controlGameId = wildcard.game.id;
+    }
     if (!i.application_id) return ephemeral("Could not open your LFG controls.");
-    const session = await beginControlSession(env.DB, i.guild_id, gameId, actor, i.application_id, i.token);
+    const session = await beginControlSession(env.DB, i.guild_id, controlGameId, actor, i.application_id, i.token);
     if (!session) return ephemeral("Your LFG controls are already opening.");
-    ctx.waitUntil(finalizeOriginalControl(env, i, gameId, actor, session));
-    return json({ type: ResponseType.ChannelMessage, data: { ...memberControlData(snapshot.game, member), flags: 64 } });
+    ctx.waitUntil(finalizeOriginalControl(env, i, controlGameId, actor, session));
+    return json({ type: ResponseType.ChannelMessage, data: { ...memberControlData(controlGame, controlMember), flags: 64 } });
   }
 
   if (action === "pause" && state !== "active") return ephemeral("You are not actively looking for this game.");
@@ -106,6 +117,30 @@ export async function handleGroupComponent(i: DiscordInteraction, env: Env, ctx:
 
   ctx.waitUntil(completeMemberAction(env, i, snapshot.game, action));
   return json({ type: ResponseType.UpdateMessage, data: memberControlData(snapshot.game, member, action) });
+}
+
+async function activeAnyMembership(
+  db: D1Database,
+  guildId: string,
+  actor: string,
+): Promise<{ game: Game; member: GroupMember } | undefined> {
+  const row = await db.prepare(`
+    SELECT games.id, games.name, games.provider_id AS providerId, games.cover_url AS coverUrl,
+      group_members.expires_at AS expiresAt
+    FROM games
+    JOIN game_groups ON game_groups.game_id = games.id AND game_groups.guild_id = games.guild_id
+    JOIN group_members ON group_members.group_id = game_groups.id
+    WHERE games.guild_id = ? AND games.provider_id = ?
+      AND group_members.user_id = ?
+      AND group_members.paused_at IS NULL
+      AND julianday(group_members.expires_at) > julianday('now')
+    LIMIT 1
+  `).bind(guildId, ANY_GAME_PROVIDER_ID, actor).first<Game & { expiresAt: string }>();
+  if (!row) return undefined;
+  return {
+    game: { id: row.id, name: row.name, providerId: row.providerId, coverUrl: row.coverUrl },
+    member: { userId: actor, expiresAt: row.expiresAt },
+  };
 }
 
 async function finalizeOriginalControl(

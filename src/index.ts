@@ -16,7 +16,7 @@ import {
 } from "./events";
 import type { DiscordInteraction, Env, Game } from "./types";
 
-const gameOption = { name: "games", description: "Games", type: 3, required: true, autocomplete: true };
+const gameOption = { name: "game", description: "Game", type: 3, autocomplete: true };
 const durationOption = { name: "duration", description: "Duration", type: 3 };
 const minPlayersOption = {
   name: "min_players",
@@ -29,7 +29,7 @@ const commands = [
   {
     name: "create",
     description: "Create a game event",
-    options: [gameOption, { name: "when", description: "When", type: 3, required: true }, minPlayersOption],
+    options: [{ name: "when", description: "When", type: 3, required: true }, gameOption, minPlayersOption],
   },
 ];
 
@@ -105,7 +105,7 @@ async function command(i: DiscordInteraction, env: Env, games: GameSelectionServ
   const name = i.data?.name;
   const actor = userId(i)!;
   try {
-    const selected = await games.resolve(i.guild_id!, String(option(i, "games") ?? ""), actor);
+    const selected = await games.resolve(i.guild_id!, String(option(i, "game") ?? ""), actor);
     if (name === "lfg") return lfg(i, env, selected, actor, ctx);
     if (name === "create") return createEvent(i, env, selected, actor, ctx);
   } catch (error) {

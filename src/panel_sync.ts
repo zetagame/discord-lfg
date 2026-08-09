@@ -29,6 +29,9 @@ import type { Env } from "./types";
 const PANEL_ATTEMPT_TIMEOUT_MS = 3000;
 const PANEL_RETRIES = 2;
 const IS_COMPONENTS_V2 = 1 << 15;
+const PANEL_TEXT_LIMIT = 3900;
+const ACTIVE_PANEL_ACCENT = 0x57F287;
+const ANY_GAME_PROVIDER_ID = "system:any";
 
 type PanelEditResult = "updated" | "missing";
 
@@ -40,16 +43,25 @@ export async function projectGamePanelAfterWrite(
 ): Promise<void> {
   const group = await loadGameGroup(env.DB, guildId, gameId);
   if (!group) return;
-  try {
-    await actionAfter(
-      `LFG panel ${gameId}`,
-      (signal) => syncGamePanelAttempt(env, guildId, gameId, preferredChannelId, signal),
-      { timeoutMs: PANEL_ATTEMPT_TIMEOUT_MS, retries: PANEL_RETRIES },
-    );
-  } catch (error) {
-    await recordPanelProjectionError(env.DB, group.id, error);
-    throw error;
+  const game = await env.DB.prepare("SELECT provider_id AS providerId FROM games WHERE id = ?").bind(gameId)
+    .first<{ providerId?: string }>();
+  const targets = game?.providerId === ANY_GAME_PROVIDER_ID
+    ? (await listGameGroups(env.DB)).filter((candidate) => candidate.guildId === guildId)
+    : [group];
+  let firstError: unknown;
+  for (const target of targets) {
+    try {
+      await actionAfter(
+        `LFG panel ${target.gameId}`,
+        (signal) => syncGamePanelAttempt(env, guildId, target.gameId, target.channelId ?? preferredChannelId, signal),
+        { timeoutMs: PANEL_ATTEMPT_TIMEOUT_MS, retries: PANEL_RETRIES },
+      );
+    } catch (error) {
+      await recordPanelProjectionError(env.DB, target.id, error);
+      firstError ??= error;
+    }
   }
+  if (firstError) throw firstError;
 }
 
 export async function syncSharedGameGroups(env: Env): Promise<void> {
@@ -169,37 +181,50 @@ async function finishProjection(env: Env, groupId: string, targetRevision: numbe
 
 async function gamePanelData(env: Env, snapshot: GameGroupSnapshot, signal: AbortSignal): Promise<Record<string, unknown>> {
   const members = await lfgMemberLines(env, snapshot.group.guildId, snapshot.activeUserIds, signal);
-  const body: string[] = [`**${snapshot.activeUserIds.length} in group**`];
-  if (members.length) body.push(`### In group\n${members.join("\n")}`);
-  if (snapshot.upcomingEvent) {
-    body.push(
-      `### Upcoming event\n**${snapshot.upcomingEvent.title}** · ${discordTimestamp(new Date(snapshot.upcomingEvent.startsAt))}\n${snapshot.upcomingEvent.yesCount} going`,
-    );
-  }
-
-  const components: Array<Record<string, unknown>> = [{
-    type: 10,
-    content: `## ${snapshot.game.name}`,
-  }];
-  if (snapshot.game.coverUrl) {
-    components.push({
+  const content = panelText(snapshot, members);
+  const primary: Record<string, unknown> = snapshot.game.coverUrl
+    ? {
       type: 9,
-      components: [{ type: 10, content: body.join("\n\n") }],
+      components: [{ type: 10, content }],
       accessory: { type: 11, media: { url: snapshot.game.coverUrl } },
-    });
-  } else {
-    components.push({ type: 10, content: body.join("\n\n") });
-  }
-  components.push({
-    type: 1,
-    components: [{ type: 2, style: 2, label: "Manage my LFG", custom_id: `group:manage:${snapshot.game.id}` }],
-  });
+    }
+    : { type: 10, content };
 
   return {
     flags: IS_COMPONENTS_V2,
     embeds: [],
-    components: [{ type: 17, components }],
+    components: [{
+      type: 17,
+      accent_color: ACTIVE_PANEL_ACCENT,
+      components: [
+        primary,
+        {
+          type: 1,
+          components: [{ type: 2, style: 2, label: "Manage my LFG", custom_id: `group:manage:${snapshot.game.id}` }],
+        },
+      ],
+    }],
   };
+}
+
+function panelText(snapshot: GameGroupSnapshot, members: string[]): string {
+  const heading = `### ${snapshot.game.name}\n**${snapshot.activeUserIds.length} in group**`;
+  const upcoming = snapshot.upcomingEvent
+    ? `\n\n-# Upcoming event\n**${snapshot.upcomingEvent.title}** · ${discordTimestamp(new Date(snapshot.upcomingEvent.startsAt))}\n-# ${snapshot.upcomingEvent.yesCount} going`
+    : "";
+  const memberBudget = Math.max(0, PANEL_TEXT_LIMIT - heading.length - upcoming.length - 1);
+  const visible: string[] = [];
+  let used = 0;
+  for (const line of members) {
+    const needed = line.length + (visible.length ? 1 : 0);
+    if (used + needed > memberBudget) {
+      if (visible.length && used + 2 <= memberBudget) visible.push("…");
+      break;
+    }
+    visible.push(line);
+    used += needed;
+  }
+  return `${heading}${visible.length ? `\n${visible.join("\n")}` : ""}${upcoming}`;
 }
 
 function panelEligible(snapshot: GameGroupSnapshot): boolean {
