@@ -1,4 +1,4 @@
-import type { Env, Game } from "./types";
+import type { Game } from "./types";
 
 const IGDB_TIMEOUT_MS = 1500;
 
@@ -59,40 +59,76 @@ export class GameSelectionService {
 
   async search(guildId: string, query: string): Promise<Game[]> {
     const cached = await this.db
-      .prepare(`SELECT DISTINCT games.id, games.name, games.provider_id AS providerId, games.cover_url AS coverUrl
+      .prepare(`SELECT DISTINCT games.id, games.name, games.provider_id AS providerId, games.cover_url AS coverUrl,
+          games.created_by_user_id AS createdByUserId
         FROM games LEFT JOIN game_aliases ON game_aliases.game_id = games.id
-        WHERE games.guild_id = ? AND (games.name LIKE ? OR game_aliases.alias LIKE ?) ORDER BY games.name LIMIT 20`)
+        WHERE games.guild_id = ? AND games.deleted_at IS NULL
+          AND (games.name LIKE ? OR game_aliases.alias LIKE ?)
+        ORDER BY games.name LIMIT 20`)
       .bind(guildId, `%${query}%`, `%${query}%`)
       .all<Game>();
     const external = cached.results.length >= 20 ? [] : await this.provider.search(query);
     return [...cached.results, ...external.filter((game) => !cached.results.some((cachedGame) => cachedGame.name.toLowerCase() === game.name.toLowerCase()))].slice(0, 20);
   }
 
-  async resolve(guildId: string, input: string): Promise<Game[]> {
+  async resolve(guildId: string, input: string, createdByUserId?: string): Promise<Game[]> {
     const names = [...new Set(input.split(",").map((name) => name.trim()).filter(Boolean))];
     if (!names.length) throw new Error("Choose at least one game.");
-    return Promise.all(names.map((name) => this.resolveOne(guildId, name)));
+    return Promise.all(names.map((name) => this.resolveOne(guildId, name, createdByUserId)));
   }
 
-  private async resolveOne(guildId: string, name: string): Promise<Game> {
+  async deleteCustomGame(guildId: string, gameId: string, actorId: string, canManageGuild: boolean): Promise<Game> {
+    const game = await this.db.prepare(`
+      SELECT id, name, provider_id AS providerId, cover_url AS coverUrl, created_by_user_id AS createdByUserId
+      FROM games
+      WHERE id = ? AND guild_id = ? AND provider_id IS NULL AND deleted_at IS NULL
+    `).bind(gameId, guildId).first<Game>();
+    if (!game) throw new Error("That custom game no longer exists.");
+    if (!canManageGuild && game.createdByUserId !== actorId) throw new Error("You can only delete custom games you added.");
+    await this.db.prepare("UPDATE games SET deleted_at = ? WHERE id = ? AND guild_id = ?")
+      .bind(new Date().toISOString(), gameId, guildId).run();
+    return game;
+  }
+
+  private async resolveOne(guildId: string, name: string, createdByUserId?: string): Promise<Game> {
     const found = await this.db
-      .prepare("SELECT id, name, provider_id AS providerId, cover_url AS coverUrl FROM games WHERE guild_id = ? AND name = ?")
+      .prepare(`SELECT id, name, provider_id AS providerId, cover_url AS coverUrl, created_by_user_id AS createdByUserId
+        FROM games WHERE guild_id = ? AND name = ? AND deleted_at IS NULL`)
       .bind(guildId, name)
       .first<Game>();
     if (found) return found;
+
     const external = (await this.provider.search(name)).find((game) => game.name.toLowerCase() === name.toLowerCase());
+    const deleted = await this.db.prepare(`
+      SELECT id FROM games WHERE guild_id = ? AND name = ? AND deleted_at IS NOT NULL
+    `).bind(guildId, external?.name ?? name).first<{ id: string }>();
+    if (deleted) {
+      await this.db.prepare(`
+        UPDATE games
+        SET provider_id = ?, cover_url = ?, created_by_user_id = ?, deleted_at = NULL
+        WHERE id = ?
+      `).bind(external?.providerId ?? null, external?.coverUrl ?? null, external ? null : createdByUserId ?? null, deleted.id).run();
+      return (await this.db.prepare(`
+        SELECT id, name, provider_id AS providerId, cover_url AS coverUrl, created_by_user_id AS createdByUserId
+        FROM games WHERE id = ?
+      `).bind(deleted.id).first<Game>())!;
+    }
+
     const game = {
       id: crypto.randomUUID(),
       name: external?.name ?? name,
       providerId: external?.providerId,
       coverUrl: external?.coverUrl,
+      createdByUserId: external ? undefined : createdByUserId,
     };
     await this.db
-      .prepare("INSERT OR IGNORE INTO games (id, guild_id, name, provider_id, cover_url) VALUES (?, ?, ?, ?, ?)")
-      .bind(game.id, guildId, game.name, game.providerId ?? null, game.coverUrl ?? null)
+      .prepare("INSERT OR IGNORE INTO games (id, guild_id, name, provider_id, cover_url, created_by_user_id) VALUES (?, ?, ?, ?, ?, ?)")
+      .bind(game.id, guildId, game.name, game.providerId ?? null, game.coverUrl ?? null, game.createdByUserId ?? null)
       .run();
-    const stored = (await this.db.prepare("SELECT id, name, provider_id AS providerId, cover_url AS coverUrl FROM games WHERE guild_id = ? AND name = ?")
-      .bind(guildId, game.name).first<Game>())!;
+    const stored = (await this.db.prepare(`
+      SELECT id, name, provider_id AS providerId, cover_url AS coverUrl, created_by_user_id AS createdByUserId
+      FROM games WHERE guild_id = ? AND name = ? AND deleted_at IS NULL
+    `).bind(guildId, game.name).first<Game>())!;
     if (name.toLowerCase() !== stored.name.toLowerCase()) await this.db.prepare("INSERT OR IGNORE INTO game_aliases (guild_id, alias, game_id) VALUES (?, ?, ?)")
       .bind(guildId, name, stored.id).run();
     return stored;
