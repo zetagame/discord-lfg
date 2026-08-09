@@ -261,8 +261,7 @@ export async function expiredUnfinalizedLfgs(db: D1Database): Promise<Array<{ lf
   return result;
 }
 
-export async function finalizeLfgExpiry(db: D1Database, guildId: string, lfgId: string, gameIds: string[]): Promise<void> {
-  await pruneInactiveOverlapPairs(db, guildId, gameIds);
+export async function markLfgFinalized(db: D1Database, lfgId: string): Promise<void> {
   await db.prepare("UPDATE lfgs SET finalized_at = ? WHERE id = ? AND finalized_at IS NULL")
     .bind(new Date().toISOString(), lfgId).run();
 }
