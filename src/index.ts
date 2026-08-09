@@ -1,7 +1,7 @@
 import { IgdbProvider, GameSelectionService } from "./games";
 import { matchingListeners, recordNotificationAction } from "./notifications";
 import { InteractionType, ResponseType, json, option, userId, verifyDiscordRequest } from "./discord";
-import { effectiveTimeZone, parseWhen } from "./time";
+import { canonicalTimeZone, effectiveTimeZone, parseWhen } from "./time";
 import { dueDeliveries, fireRsvpTrigger } from "./events";
 import type { DiscordInteraction, Env, Game } from "./types";
 
@@ -13,6 +13,16 @@ const commands = [
   { name: "mute", description: "Stop game alerts", options: [gameOption, durationOption] },
   { name: "lfg", description: "Post a looking-for-group alert", options: [gameOption, durationOption] },
   { name: "create", description: "Create a game event", options: [gameOption, { name: "when", description: "When", type: 3, required: true }] },
+];
+const timezoneOptions = [
+  "America/New_York",
+  "America/Chicago",
+  "America/Denver",
+  "America/Los_Angeles",
+  "Europe/London",
+  "Europe/Berlin",
+  "Asia/Tokyo",
+  "Australia/Sydney",
 ];
 
 export default {
@@ -51,9 +61,9 @@ async function command(i: DiscordInteraction, env: Env, games: GameSelectionServ
   const actor = userId(i)!;
   try {
     const selected = await games.resolve(i.guild_id!, String(option(i, "games") ?? ""));
-    if (name === "listen") return listen(i, env, selected, "listen");
-    if (name === "unlisten" || name === "mute") return listen(i, env, selected, "unlisten");
-    if (name === "lfg") return lfg(i, env, selected);
+    if (name === "listen") return listen(i, env, selected, "listen", actor);
+    if (name === "unlisten" || name === "mute") return listen(i, env, selected, "unlisten", actor);
+    if (name === "lfg") return lfg(i, env, selected, actor);
     if (name === "create") return createEvent(i, env, selected, actor);
   } catch (error) {
     return message(error instanceof Error ? error.message : "Could not complete that command.", true);
@@ -61,33 +71,37 @@ async function command(i: DiscordInteraction, env: Env, games: GameSelectionServ
   return message("Unknown command.", true);
 }
 
-async function listen(i: DiscordInteraction, env: Env, games: Game[], action: "listen" | "unlisten"): Promise<Response> {
-  const timeZone = await userTimeZone(env.DB, i.guild_id!, userId(i)!);
+async function listen(i: DiscordInteraction, env: Env, games: Game[], action: "listen" | "unlisten", actor: string): Promise<Response> {
+  const userZone = await userTimeZone(env.DB, i.guild_id!, actor);
+  const timeZone = userZone.timeZone;
   const duration = parseWhen(String(option(i, "duration") ?? ""), timeZone);
   if (option(i, "duration") && !duration) return message("Use a duration such as 30m, 2h, 3d, tonight, or this weekend.", true);
-  await recordNotificationAction(env.DB, i.guild_id!, userId(i)!, games.map((game) => game.id), action, duration);
+  await recordNotificationAction(env.DB, i.guild_id!, actor, games.map((game) => game.id), action, duration);
+  if (userZone.shouldPrompt) await maybeSendTimezonePrompt(i, env);
   const word = action === "listen" ? "Listening for" : "Not listening for";
   return message(`${word} ${gameNames(games)}${duration ? ` until ${duration.toISOString()}` : ""}.`, true);
 }
 
-async function lfg(i: DiscordInteraction, env: Env, games: Game[]): Promise<Response> {
-  const timeZone = await userTimeZone(env.DB, i.guild_id!, userId(i)!);
+async function lfg(i: DiscordInteraction, env: Env, games: Game[], actor: string): Promise<Response> {
+  const userZone = await userTimeZone(env.DB, i.guild_id!, actor);
+  const timeZone = userZone.timeZone;
   const duration = option(i, "duration") ? parseWhen(String(option(i, "duration")), timeZone) : new Date(Date.now() + 2 * 3_600_000);
   if (!duration) return message("Use a duration such as 30m, 2h, 3d, tonight, or this weekend.", true);
   const id = crypto.randomUUID();
   await env.DB.batch([
     env.DB.prepare("INSERT INTO lfgs (id, guild_id, channel_id, author_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)")
-      .bind(id, i.guild_id, i.channel_id, userId(i), duration.toISOString(), new Date().toISOString()),
+      .bind(id, i.guild_id, i.channel_id, actor, duration.toISOString(), new Date().toISOString()),
     ...games.map((game) => env.DB.prepare("INSERT INTO lfg_games (lfg_id, game_id) VALUES (?, ?)").bind(id, game.id)),
   ]);
-  const listeners = await matchingListeners(env.DB, i.guild_id!, games.map((game) => game.id), userId(i)!);
+  const listeners = await matchingListeners(env.DB, i.guild_id!, games.map((game) => game.id), actor);
+  if (userZone.shouldPrompt) await maybeSendTimezonePrompt(i, env);
   return publicEmbed("LFG", `${gameNames(games)}\nRelevant until ${duration.toISOString()}${listeners.length ? `\n${listeners.map((id) => `<@${id}>`).join(" ")}` : ""}`);
 }
 
 async function createEvent(i: DiscordInteraction, env: Env, games: Game[], actor: string): Promise<Response> {
-  const timeZone = await userTimeZone(env.DB, i.guild_id!, actor);
+  const userZone = await userTimeZone(env.DB, i.guild_id!, actor);
   const whenInput = String(option(i, "when") ?? "");
-  const startsAt = parseWhen(whenInput, timeZone);
+  const startsAt = parseWhen(whenInput, userZone.timeZone);
   const trigger = parseTrigger(whenInput);
   if (!startsAt && !trigger) return message("Use a scheduled date/time, or a trigger such as \"3 yes RSVPs\".", true);
   const id = crypto.randomUUID();
@@ -99,11 +113,20 @@ async function createEvent(i: DiscordInteraction, env: Env, games: Game[], actor
   ]);
   const components: unknown[] = [{ type: 1, components: [["yes", 3], ["maybe", 2], ["no", 4]].map(([status, style]) => ({ type: 2, style, label: String(status).replace(/^./, (letter) => letter.toUpperCase()), custom_id: `rsvp:${id}:${status}` })) }];
   if (games.length > 1) components.push({ type: 1, components: [{ type: 3, custom_id: `vote:${id}`, placeholder: "Vote for games", min_values: 1, max_values: games.length, options: games.map((game) => ({ label: game.name, value: game.id })) }] });
-  return json({ type: ResponseType.ChannelMessage, data: { embeds: [{ title: "Game night", description: `Games: ${gameNames(games)}\n${trigger ? `Trigger: ${whenInput}` : `When: ${startsAt!.toISOString()} (${timeZone})`}` }], components } });
+  if (userZone.shouldPrompt) await maybeSendTimezonePrompt(i, env);
+  return json({ type: ResponseType.ChannelMessage, data: { embeds: [{ title: "Game night", description: `Games: ${gameNames(games)}\n${trigger ? `Trigger: ${whenInput}` : `When: ${startsAt!.toISOString()} (${userZone.timeZone})`}` }], components } });
 }
 
 async function component(i: DiscordInteraction, env: Env): Promise<Response> {
   const [action, eventId, status] = i.data?.custom_id?.split(":") ?? [];
+  if (action === "timezone" && status === "select") {
+    if (!i.guild_id || !userId(i)) return message("Invalid timezone selection context.", true);
+    const selected = canonicalTimeZone(i.data?.values?.[0]);
+    if (!selected) return message("Invalid timezone selection.", true);
+    await env.DB.prepare("UPDATE users SET timezone = ?, timezone_prompted_at = ? WHERE guild_id = ? AND user_id = ?")
+      .bind(selected, new Date().toISOString(), i.guild_id, userId(i)).run();
+    return message(`Timezone set to ${selected}.`, true);
+  }
   if (!eventId) return message("Invalid event action.", true);
   const event = await env.DB.prepare("SELECT id FROM events WHERE id = ? AND guild_id = ?").bind(eventId, i.guild_id).first();
   if (!event) return message("This event is not available in this server.", true);
@@ -123,10 +146,41 @@ async function component(i: DiscordInteraction, env: Env): Promise<Response> {
   return message("Invalid event action.", true);
 }
 
-async function userTimeZone(db: D1Database, guildId: string, userId: string): Promise<string> {
-  const user = await db.prepare("SELECT timezone FROM users WHERE guild_id = ? AND user_id = ?").bind(guildId, userId).first<{ timezone?: string }>();
-  await db.prepare("INSERT OR IGNORE INTO users (guild_id, user_id, timezone_prompted_at) VALUES (?, ?, ?)").bind(guildId, userId, new Date().toISOString()).run();
-  return effectiveTimeZone(user?.timezone);
+async function userTimeZone(db: D1Database, guildId: string, userId: string): Promise<{ timeZone: string; shouldPrompt: boolean }> {
+  const user = await db.prepare("SELECT timezone, timezone_prompted_at FROM users WHERE guild_id = ? AND user_id = ?")
+    .bind(guildId, userId).first<{ timezone?: string; timezone_prompted_at?: string }>();
+  const shouldPrompt = !user?.timezone && !user?.timezone_prompted_at;
+  if (!user) {
+    await db.prepare("INSERT OR IGNORE INTO users (guild_id, user_id, timezone_prompted_at) VALUES (?, ?, ?)")
+      .bind(guildId, userId, shouldPrompt ? new Date().toISOString() : null).run();
+  } else if (shouldPrompt) {
+    await db.prepare("UPDATE users SET timezone_prompted_at = ? WHERE guild_id = ? AND user_id = ?")
+      .bind(new Date().toISOString(), guildId, userId).run();
+  }
+  return { timeZone: effectiveTimeZone(user?.timezone), shouldPrompt };
+}
+
+async function maybeSendTimezonePrompt(i: DiscordInteraction, env: Env): Promise<void> {
+  if (!i.application_id) return;
+  await fetch(`https://discord.com/api/v10/webhooks/${i.application_id}/${i.token}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      flags: 64,
+      content: "Optional: pick your timezone for local time parsing. Default stays America/New_York if you skip this.",
+      components: [{
+        type: 1,
+        components: [{
+          type: 3,
+          custom_id: "timezone:select",
+          placeholder: "Select your timezone (optional)",
+          min_values: 1,
+          max_values: 1,
+          options: timezoneOptions.map((timeZone) => ({ label: timeZone, value: timeZone })),
+        }],
+      }],
+    }),
+  });
 }
 
 function parseTrigger(value: string): { type: string; threshold: number } | undefined {

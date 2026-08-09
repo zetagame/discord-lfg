@@ -62,13 +62,16 @@ timezone; scheduled timestamps are persisted as UTC.
 
 Scheduled events have a UTC `starts_at`; trigger-based events have no
 `starts_at` and activate when their persisted trigger is met. Yes RSVPs receive
-a one-hour reminder and a start notification, Maybe RSVPs receive the reminder,
-and No RSVPs receive neither. Delivery records make Cron retries idempotent.
+a one-hour reminder before start plus a start notification at/after start.
+Maybe RSVPs receive only the one-hour reminder window before start, and No RSVPs
+receive neither. Delivery records make Cron retries idempotent.
 RSVP-count triggers atomically fire once, activate their event, and post an
 activation notification.
 
 HTTP Interactions cannot observe guild-member joins, so a no-Gateway deployment
-cannot currently prompt at join or evaluate online-presence triggers. The bot
-works with the fallback timezone without that prompt. Trigger definitions for
-people online and listeners online are retained for future Gateway presence
-input; only RSVP-count triggers are evaluated by the HTTP-only Worker.
+cannot currently prompt at join or evaluate online-presence triggers. On first
+use without an explicit timezone, the bot sends a one-time optional ephemeral
+timezone selector; if ignored, parsing still uses the `America/New_York`
+fallback. Trigger definitions for people online and listeners online are
+retained for future Gateway presence input; only RSVP-count triggers are
+evaluated by the HTTP-only Worker.

@@ -1,12 +1,15 @@
 const DEFAULT_TIME_ZONE = "America/New_York";
 
 export function effectiveTimeZone(timeZone?: string | null): string {
-  if (!timeZone) return DEFAULT_TIME_ZONE;
+  return canonicalTimeZone(timeZone) ?? DEFAULT_TIME_ZONE;
+}
+
+export function canonicalTimeZone(timeZone?: string | null): string | undefined {
+  if (!timeZone) return undefined;
   try {
-    new Intl.DateTimeFormat("en-US", { timeZone });
-    return timeZone;
+    return new Intl.DateTimeFormat("en-US", { timeZone }).resolvedOptions().timeZone;
   } catch {
-    return DEFAULT_TIME_ZONE;
+    return undefined;
   }
 }
 
@@ -21,8 +24,9 @@ export function parseDuration(input: string | undefined, timeZone = DEFAULT_TIME
   if (value === "today") return localEndOfDay(now, timeZone);
   if (value === "tonight") {
     const local = localParts(now, timeZone);
-    const tonight = zonedUtc(local.year, local.month, local.day, 21, 0, timeZone);
-    return tonight > now ? tonight : zonedUtc(local.year, local.month, local.day + 1, 21, 0, timeZone);
+    return local.hour < 3
+      ? zonedUtc(local.year, local.month, local.day, 3, 0, timeZone)
+      : localEndOfDay(now, timeZone);
   }
   if (value === "tomorrow") {
     const local = localParts(now, timeZone);
@@ -31,7 +35,8 @@ export function parseDuration(input: string | undefined, timeZone = DEFAULT_TIME
   if (value === "this weekend") {
     const local = localParts(now, timeZone);
     const localDate = new Date(Date.UTC(local.year, local.month - 1, local.day));
-    const days = (6 - localDate.getUTCDay() + 7) % 7;
+    const day = localDate.getUTCDay();
+    const days = day === 0 ? 0 : day === 6 ? 8 : 7 - day;
     return zonedUtc(local.year, local.month, local.day + days, 23, 59, timeZone, 999);
   }
   return undefined;
@@ -71,7 +76,7 @@ function parseUntil(value: string, timeZone: string, now: Date): Date | undefine
 function localParts(date: Date, timeZone: string) {
   const parts = new Intl.DateTimeFormat("en-US", { timeZone, year: "numeric", month: "numeric", day: "numeric", hour: "numeric", hourCycle: "h23", minute: "numeric" }).formatToParts(date);
   const get = (type: string) => Number(parts.find((part) => part.type === type)?.value);
-  return { year: get("year"), month: get("month"), day: get("day") };
+  return { year: get("year"), month: get("month"), day: get("day"), hour: get("hour") };
 }
 
 function zonedUtc(year: number, month: number, day: number, hour: number, minute: number, timeZone: string, milliseconds = 0): Date {

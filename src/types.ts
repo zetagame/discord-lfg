@@ -8,6 +8,7 @@ export interface Env {
 
 export interface DiscordInteraction {
   id: string;
+  application_id?: string;
   token: string;
   type: number;
   guild_id?: string;

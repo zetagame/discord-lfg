@@ -20,15 +20,27 @@ export async function matchingListeners(db: D1Database, guildId: string, gameIds
   if (!gameIds.length) return [];
   const placeholders = gameIds.map(() => "?").join(",");
   const result = await db.prepare(`
-    WITH latest AS (
-      SELECT user_id, game_id, action,
-        ROW_NUMBER() OVER (PARTITION BY user_id, game_id ORDER BY created_at DESC, id DESC) AS position
-      FROM notification_actions
-      WHERE guild_id = ? AND game_id IN (${placeholders})
-        AND (expires_at IS NULL OR julianday(expires_at) > julianday('now'))
-    )
-    SELECT DISTINCT user_id FROM latest
-    WHERE position = 1 AND action = 'listen' AND user_id != ?
-  `).bind(guildId, ...gameIds, excludedUserId).all<{ user_id: string }>();
-  return result.results.map(({ user_id }) => user_id);
+    SELECT id, user_id, game_id, action, created_at
+    FROM notification_actions
+    WHERE guild_id = ? AND game_id IN (${placeholders}) AND user_id != ?
+      AND (expires_at IS NULL OR julianday(expires_at) > julianday('now'))
+    ORDER BY created_at DESC, id DESC
+  `).bind(guildId, ...gameIds, excludedUserId).all<{
+    id: string;
+    user_id: string;
+    game_id: string;
+    action: NotificationAction;
+    created_at: string;
+  }>();
+  const latest = new Map<string, NotificationAction>();
+  for (const row of result.results) {
+    const key = `${row.user_id}:${row.game_id}`;
+    if (!latest.has(key)) latest.set(key, row.action);
+  }
+  const users = new Set<string>();
+  for (const [key, action] of latest.entries()) {
+    if (action !== "listen") continue;
+    users.add(key.slice(0, key.indexOf(":")));
+  }
+  return [...users];
 }

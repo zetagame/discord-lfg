@@ -3,10 +3,8 @@ export type EventDeliveryKind = "reminder" | "start";
 
 export function dueDeliveries(startsAt: Date, status: RsvpStatus, now: Date): EventDeliveryKind[] {
   if (status === "no") return [];
-  const deliveries: EventDeliveryKind[] = [];
-  if (startsAt.getTime() - 3_600_000 <= now.getTime() && now < startsAt) deliveries.push("reminder");
-  if (status === "yes" && startsAt <= now) deliveries.push("start");
-  return deliveries;
+  if (now >= startsAt) return status === "yes" ? ["start"] : [];
+  return startsAt.getTime() - 3_600_000 <= now.getTime() ? ["reminder"] : [];
 }
 
 export async function fireRsvpTrigger(db: D1Database, eventId: string, now = new Date()): Promise<boolean> {
