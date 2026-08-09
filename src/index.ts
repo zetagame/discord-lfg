@@ -1,7 +1,7 @@
 import { IgdbProvider, GameSelectionService } from "./games";
 import { matchingListeners, recordNotificationAction } from "./notifications";
 import { InteractionType, ResponseType, json, option, userId, verifyDiscordRequest } from "./discord";
-import { effectiveTimeZone, parseDuration, parseWhen } from "./time";
+import { effectiveTimeZone, parseWhen } from "./time";
 import { dueDeliveries, fireRsvpTrigger } from "./events";
 import type { DiscordInteraction, Env, Game } from "./types";
 
@@ -63,7 +63,7 @@ async function command(i: DiscordInteraction, env: Env, games: GameSelectionServ
 
 async function listen(i: DiscordInteraction, env: Env, games: Game[], action: "listen" | "unlisten"): Promise<Response> {
   const timeZone = await userTimeZone(env.DB, i.guild_id!, userId(i)!);
-  const duration = parseDuration(String(option(i, "duration") ?? ""), timeZone);
+  const duration = parseWhen(String(option(i, "duration") ?? ""), timeZone);
   if (option(i, "duration") && !duration) return message("Use a duration such as 30m, 2h, 3d, tonight, or this weekend.", true);
   await recordNotificationAction(env.DB, i.guild_id!, userId(i)!, games.map((game) => game.id), action, duration);
   const word = action === "listen" ? "Listening for" : "Not listening for";
@@ -72,7 +72,7 @@ async function listen(i: DiscordInteraction, env: Env, games: Game[], action: "l
 
 async function lfg(i: DiscordInteraction, env: Env, games: Game[]): Promise<Response> {
   const timeZone = await userTimeZone(env.DB, i.guild_id!, userId(i)!);
-  const duration = option(i, "duration") ? parseDuration(String(option(i, "duration")), timeZone) : new Date(Date.now() + 2 * 3_600_000);
+  const duration = option(i, "duration") ? parseWhen(String(option(i, "duration")), timeZone) : new Date(Date.now() + 2 * 3_600_000);
   if (!duration) return message("Use a duration such as 30m, 2h, 3d, tonight, or this weekend.", true);
   const id = crypto.randomUUID();
   await env.DB.batch([
@@ -160,17 +160,16 @@ async function notifyActivation(env: Env, eventId: string): Promise<void> {
 
 async function deliver(env: Env, eventId: string, userId: string, kind: "reminder" | "start" | "activation", channelId: string, content: string): Promise<void> {
   if (!env.DISCORD_BOT_TOKEN) return;
-  const existing = await env.DB.prepare("SELECT 1 FROM event_deliveries WHERE event_id = ? AND user_id = ? AND kind = ?")
-    .bind(eventId, userId, kind).first();
-  if (existing) return;
+  const claimed = await env.DB.prepare("INSERT OR IGNORE INTO event_deliveries (event_id, user_id, kind, delivered_at) VALUES (?, ?, ?, ?)")
+    .bind(eventId, userId, kind, new Date().toISOString()).run();
+  if (!claimed.meta.changes) return;
   const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
     method: "POST",
     headers: { authorization: `Bot ${env.DISCORD_BOT_TOKEN}`, "content-type": "application/json" },
     body: JSON.stringify({ content }),
   });
-  if (!response.ok) return;
-  await env.DB.prepare("INSERT OR IGNORE INTO event_deliveries (event_id, user_id, kind, delivered_at) VALUES (?, ?, ?, ?)")
-    .bind(eventId, userId, kind, new Date().toISOString()).run();
+  if (!response.ok) await env.DB.prepare("DELETE FROM event_deliveries WHERE event_id = ? AND user_id = ? AND kind = ?")
+    .bind(eventId, userId, kind).run();
 }
 function message(content: string, ephemeral: boolean): Response { return json({ type: ResponseType.ChannelMessage, data: { content, flags: ephemeral ? 64 : undefined } }); }
 function publicEmbed(title: string, description: string): Response { return json({ type: ResponseType.ChannelMessage, data: { embeds: [{ title, description }] } }); }

@@ -10,15 +10,18 @@ Interactions over HTTP; it does not require a Gateway connection.
    worker's `/` URL as the application's **Interactions Endpoint URL**.
 2. Create a D1 database with `npx wrangler d1 create discord-lfg`, then replace
    `database_id` in `wrangler.jsonc`.
-3. Copy `.env.example` to `.dev.vars` and set `DISCORD_PUBLIC_KEY`. Add
-   `IGDB_CLIENT_ID` and `IGDB_CLIENT_SECRET` to enable IGDB search. Set
-   production values with `npx wrangler secret put NAME`; never commit secrets.
+3. Copy `.env.example` to `.dev.vars` and set `DISCORD_PUBLIC_KEY` and
+   `DISCORD_BOT_TOKEN`. Add `IGDB_CLIENT_ID` and `IGDB_CLIENT_SECRET` to enable
+   IGDB search. Set production values with `npx wrangler secret put NAME`;
+   never commit secrets.
 4. Run `npm run migrations`, then `npm run dev`.
 5. Set `DISCORD_APPLICATION_ID` and `DISCORD_BOT_TOKEN` locally, and run
    `npm run register-commands` while the development worker is running. Set
    `DISCORD_COMMANDS_URL` to the deployed worker's `/commands` URL to register
    production commands.
-6. Run `npm run check`, `npm test`, and `npm run deploy` as appropriate.
+6. Run `npm run check`, `npm test`, and `npm run deploy` as appropriate. The
+   deployed Worker needs the five-minute Cron Trigger in `wrangler.jsonc` to
+   check D1 for event lifecycle notifications.
 
 `npm run typecheck` is an alias for the type check. For a remote D1 database,
 use `npx wrangler d1 migrations apply discord-lfg --remote`.
@@ -35,8 +38,8 @@ use `npx wrangler d1 migrations apply discord-lfg --remote`.
 - `/create Games When` creates an RSVP event. One game has only RSVP buttons;
   multiple games also have a separate game-voting select.
 
-Durations accept `30m`, `2h`, `3d`, `today`, `tonight`, `tomorrow`, and `this
-weekend`. Event times also accept `until 10pm` and `until Friday`, scheduled
+Durations accept `30m`, `2h`, `3d`, `today`, `tonight`, `tomorrow`, `this
+weekend`, `until 10pm`, and `until Friday`. Event times also accept scheduled
 local timestamps such as `2026-08-09 20:00`, and initial trigger phrases such
 as `3 yes RSVPs`.
 
@@ -54,8 +57,18 @@ temporary listen or unlisten reveals the prior instruction; no prior state is
 deleted or overwritten.
 
 Users without an explicit IANA timezone use `America/New_York`. Scheduled
-input is interpreted in that effective timezone and persisted as UTC. HTTP
-Interactions cannot observe guild-member joins, so a no-Gateway deployment
-cannot currently prompt at join or evaluate online-presence triggers. Trigger
-definitions are persisted and fire-once state is represented in D1; connecting
-Gateway presence handling is required to activate online/listener triggers.
+input and local-calendar duration expressions are interpreted in that effective
+timezone; scheduled timestamps are persisted as UTC.
+
+Scheduled events have a UTC `starts_at`; trigger-based events have no
+`starts_at` and activate when their persisted trigger is met. Yes RSVPs receive
+a one-hour reminder and a start notification, Maybe RSVPs receive the reminder,
+and No RSVPs receive neither. Delivery records make Cron retries idempotent.
+RSVP-count triggers atomically fire once, activate their event, and post an
+activation notification.
+
+HTTP Interactions cannot observe guild-member joins, so a no-Gateway deployment
+cannot currently prompt at join or evaluate online-presence triggers. The bot
+works with the fallback timezone without that prompt. Trigger definitions for
+people online and listeners online are retained for future Gateway presence
+input; only RSVP-count triggers are evaluated by the HTTP-only Worker.

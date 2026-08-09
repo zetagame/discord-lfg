@@ -4,7 +4,7 @@ export type EventDeliveryKind = "reminder" | "start";
 export function dueDeliveries(startsAt: Date, status: RsvpStatus, now: Date): EventDeliveryKind[] {
   if (status === "no") return [];
   const deliveries: EventDeliveryKind[] = [];
-  if (startsAt.getTime() - 3_600_000 <= now.getTime()) deliveries.push("reminder");
+  if (startsAt.getTime() - 3_600_000 <= now.getTime() && now < startsAt) deliveries.push("reminder");
   if (status === "yes" && startsAt <= now) deliveries.push("start");
   return deliveries;
 }

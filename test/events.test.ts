@@ -6,8 +6,8 @@ test("scheduled delivery targets RSVP statuses correctly and remains due after t
   const start = new Date("2026-01-01T12:00:00.000Z");
   assert.deepEqual(dueDeliveries(start, "yes", new Date("2026-01-01T10:59:59.000Z")), []);
   assert.deepEqual(dueDeliveries(start, "yes", new Date("2026-01-01T11:00:00.000Z")), ["reminder"]);
-  assert.deepEqual(dueDeliveries(start, "maybe", new Date("2026-01-01T12:00:00.000Z")), ["reminder"]);
-  assert.deepEqual(dueDeliveries(start, "yes", new Date("2026-01-01T12:00:00.000Z")), ["reminder", "start"]);
+  assert.deepEqual(dueDeliveries(start, "maybe", new Date("2026-01-01T12:00:00.000Z")), []);
+  assert.deepEqual(dueDeliveries(start, "yes", new Date("2026-01-01T12:00:00.000Z")), ["start"]);
   assert.deepEqual(dueDeliveries(start, "no", new Date("2026-01-01T12:00:00.000Z")), []);
 });
 
