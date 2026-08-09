@@ -21,10 +21,12 @@ export async function recordNotificationAction(
 export async function currentListenedGames(db: D1Database, guildId: string, userId: string, query = ""): Promise<Game[]> {
   const result = await db.prepare(`
     SELECT notification_actions.id, notification_actions.game_id, notification_actions.action, notification_actions.created_at,
-      games.name, games.provider_id AS providerId, games.cover_url AS coverUrl
+      games.name, games.provider_id AS providerId, games.cover_url AS coverUrl,
+      games.created_by_user_id AS createdByUserId
     FROM notification_actions
     JOIN games ON games.id = notification_actions.game_id
     WHERE notification_actions.guild_id = ? AND notification_actions.user_id = ?
+      AND games.deleted_at IS NULL
       AND (notification_actions.expires_at IS NULL OR julianday(notification_actions.expires_at) > julianday('now'))
       AND games.name LIKE ?
     ORDER BY notification_actions.created_at DESC, notification_actions.id DESC
@@ -36,6 +38,7 @@ export async function currentListenedGames(db: D1Database, guildId: string, user
     name: string;
     providerId?: string;
     coverUrl?: string;
+    createdByUserId?: string;
   }>();
   const latest = new Map<string, (typeof result.results)[number]>();
   for (const row of result.results) {
@@ -43,7 +46,13 @@ export async function currentListenedGames(db: D1Database, guildId: string, user
   }
   return [...latest.values()]
     .filter((row) => row.action === "listen")
-    .map((row) => ({ id: row.game_id, name: row.name, providerId: row.providerId, coverUrl: row.coverUrl }));
+    .map((row) => ({
+      id: row.game_id,
+      name: row.name,
+      providerId: row.providerId,
+      coverUrl: row.coverUrl,
+      createdByUserId: row.createdByUserId,
+    }));
 }
 
 export async function matchingLfgCreators(db: D1Database, guildId: string, gameIds: string[], excludedUserId: string): Promise<string[]> {
