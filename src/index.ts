@@ -16,7 +16,7 @@ import {
 } from "./events";
 import type { DiscordInteraction, Env, Game } from "./types";
 
-const gameOption = { name: "games", description: "Games", type: 3, required: true, autocomplete: true };
+const gameOption = { name: "game", description: "Game (default: Any)", type: 3, autocomplete: true };
 const durationOption = { name: "duration", description: "Duration", type: 3 };
 const minPlayersOption = {
   name: "min_players",
@@ -29,7 +29,7 @@ const commands = [
   {
     name: "create",
     description: "Create a game event",
-    options: [gameOption, { name: "when", description: "When", type: 3, required: true }, minPlayersOption],
+    options: [{ name: "when", description: "When", type: 3, required: true }, gameOption, minPlayersOption],
   },
 ];
 
@@ -43,6 +43,35 @@ function getIgdbProvider(env: Env): IgdbProvider {
     };
   }
   return cachedIgdb.provider;
+}
+
+type AutocompleteChoice = { name: string; value: string };
+const recentAutocompleteChoices = new Map<string, { choice: AutocompleteChoice; expiresAt: number }>();
+const AUTOCOMPLETE_CHOICE_TTL_MS = 60_000;
+
+function autocompleteCacheKey(guildId: string, value: string): string {
+  return `${guildId}:${value.trim().toLowerCase()}`;
+}
+
+function cachedAutocompleteChoice(guildId: string, value: string): AutocompleteChoice | undefined {
+  const key = autocompleteCacheKey(guildId, value);
+  const cached = recentAutocompleteChoices.get(key);
+  if (!cached) return undefined;
+  if (cached.expiresAt <= Date.now()) {
+    recentAutocompleteChoices.delete(key);
+    return undefined;
+  }
+  return cached.choice;
+}
+
+function rememberAutocompleteChoices(guildId: string, choices: AutocompleteChoice[]): void {
+  const expiresAt = Date.now() + AUTOCOMPLETE_CHOICE_TTL_MS;
+  for (const choice of choices) recentAutocompleteChoices.set(autocompleteCacheKey(guildId, choice.value), { choice, expiresAt });
+  if (recentAutocompleteChoices.size <= 200) return;
+  const now = Date.now();
+  for (const [key, entry] of recentAutocompleteChoices) {
+    if (entry.expiresAt <= now) recentAutocompleteChoices.delete(key);
+  }
 }
 
 const timezoneOptions = [
@@ -82,30 +111,46 @@ export default {
 async function autocomplete(interaction: DiscordInteraction, games: GameSelectionService): Promise<Response> {
   const focused = interaction.data?.options?.find((item) => item.focused);
   const query = String(focused?.value ?? "").trim();
-  const choices = await games.search(interaction.guild_id!, query);
-  if (query && !choices.some((game) => game.name.toLowerCase() === query.toLowerCase())) {
-    choices.push({ id: "custom", name: `Use "${query}"` });
+  const cached = query ? cachedAutocompleteChoice(interaction.guild_id!, query) : undefined;
+  if (cached) return json({ type: ResponseType.Autocomplete, data: { choices: [cached] } });
+
+  const gamesFound = await games.search(interaction.guild_id!, query);
+  if (query && !gamesFound.some((game) => game.name.toLowerCase() === query.toLowerCase())) {
+    gamesFound.push({ id: "custom", name: `Use "${query}"` });
   }
-  return json({
-    type: ResponseType.Autocomplete,
-    data: {
-      choices: choices.slice(0, 25).map((game) => {
-        const customFallback = game.id === "custom";
-        const suffix = !customFallback && !game.providerId ? " · custom" : "";
-        return {
-          name: `${game.name}${suffix}`.slice(0, 100),
-          value: customFallback ? query : game.name,
-        };
-      }),
-    },
+  const choices = gamesFound.slice(0, 25).map((game) => {
+    const customFallback = game.id === "custom";
+    const suffix = !customFallback && !game.providerId ? " · custom" : "";
+    return {
+      name: `${game.name}${suffix}`.slice(0, 100),
+      value: customFallback ? query : game.name,
+    };
   });
+  rememberAutocompleteChoices(interaction.guild_id!, choices);
+  return json({ type: ResponseType.Autocomplete, data: { choices } });
+}
+
+async function commandGames(i: DiscordInteraction, env: Env, games: GameSelectionService, actor: string): Promise<Game[]> {
+  const input = String(option(i, "game") ?? "").trim();
+  if (input && input.toLowerCase() !== "any") return games.resolve(i.guild_id!, input, actor);
+
+  await env.DB.prepare("INSERT OR IGNORE INTO games (id, guild_id, name, provider_id) VALUES (?, ?, 'Any', 'internal:any')")
+    .bind(`any-${i.guild_id}`, i.guild_id).run();
+  await env.DB.prepare("UPDATE games SET provider_id = 'internal:any', created_by_user_id = NULL, deleted_at = NULL WHERE guild_id = ? AND name = 'Any'")
+    .bind(i.guild_id).run();
+  const anyGame = await env.DB.prepare(`
+    SELECT id, name, provider_id AS providerId, cover_url AS coverUrl, created_by_user_id AS createdByUserId
+    FROM games WHERE guild_id = ? AND name = 'Any' AND deleted_at IS NULL
+  `).bind(i.guild_id).first<Game>();
+  if (!anyGame) throw new Error("Could not open the Any-game pool.");
+  return [anyGame];
 }
 
 async function command(i: DiscordInteraction, env: Env, games: GameSelectionService, ctx: ExecutionContext): Promise<Response> {
   const name = i.data?.name;
   const actor = userId(i)!;
   try {
-    const selected = await games.resolve(i.guild_id!, String(option(i, "games") ?? ""), actor);
+    const selected = await commandGames(i, env, games, actor);
     if (name === "lfg") return lfg(i, env, selected, actor, ctx);
     if (name === "create") return createEvent(i, env, selected, actor, ctx);
   } catch (error) {
