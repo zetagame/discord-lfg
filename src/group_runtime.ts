@@ -4,6 +4,8 @@ import {
   clearControlSession,
   finalizeControlSession,
   pruneControlSessions,
+  refreshControlSessionToken,
+  restorePreviousControlSession,
   type LfgControlSession,
   type PendingControlSession,
 } from "./control_sessions";
@@ -101,13 +103,23 @@ async function finalizeManagePanel(
 ): Promise<void> {
   if (!i.application_id || !i.guild_id) return;
   const messageId = await interactionOriginalMessageId(i.application_id, i.token);
-  if (!messageId) return;
+  if (!messageId) {
+    await deleteOriginalWebhookMessage(i.application_id, i.token);
+    await restorePreviousControlSession(env.DB, i.guild_id, gameId, actor, pending.nonce, pending.previous);
+    return;
+  }
   const current = await finalizeControlSession(env.DB, i.guild_id, gameId, actor, pending.nonce, messageId);
   if (!current) {
     await deleteOriginalWebhookMessage(i.application_id, i.token);
     return;
   }
-  if (pending.previous?.messageId) await deleteStoredControlMessage(pending.previous);
+  if (pending.previous?.messageId) {
+    const closed = await deleteStoredControlMessage(pending.previous);
+    if (!closed) {
+      await deleteOriginalWebhookMessage(i.application_id, i.token);
+      await restorePreviousControlSession(env.DB, i.guild_id, gameId, actor, pending.nonce, pending.previous);
+    }
+  }
 }
 
 async function completeMemberAction(
@@ -124,8 +136,11 @@ async function completeMemberAction(
         await editInteractionOriginal(i, memberControlData(game, undefined));
       }
       await clearControlSession(env.DB, i.guild_id!, game.id, actor, i.message?.id);
-    } else if (!await editInteractionOriginal(i, memberControlData(game, result.member))) {
-      await interactionFollowup(i, "Your LFG state changed, but Discord could not refresh your controls.");
+    } else {
+      await refreshControlSessionToken(env.DB, i.guild_id!, game.id, actor, i.message?.id, i.application_id, i.token);
+      if (!await editInteractionOriginal(i, memberControlData(game, result.member))) {
+        await interactionFollowup(i, "Your LFG state changed, but Discord could not refresh your controls.");
+      }
     }
     await syncGamePanel(env, i.guild_id!, game.id, i.channel_id);
     if (action === "resume") await notifyGroupOverlaps(env, i.channel_id!, actor, [result]);
@@ -386,20 +401,27 @@ async function interactionOriginalMessageId(applicationId: string, token: string
   return undefined;
 }
 
-async function deleteStoredControlMessage(session: LfgControlSession): Promise<void> {
-  if (!session.messageId) return;
-  await deleteOriginalWebhookMessage(session.applicationId, session.interactionToken);
+async function deleteStoredControlMessage(session: LfgControlSession): Promise<boolean> {
+  if (!session.messageId) return true;
+  return deleteOriginalWebhookMessage(session.applicationId, session.interactionToken);
 }
 
 async function deleteOriginalWebhookMessage(applicationId: string, token: string): Promise<boolean> {
-  try {
-    const response = await fetch(`https://discord.com/api/v10/webhooks/${applicationId}/${token}/messages/@original`, { method: "DELETE" });
-    if (!response.ok && response.status !== 404) console.error("Discord control message delete failed", response.status, await response.text());
-    return response.ok || response.status === 404;
-  } catch (error) {
-    console.error("Discord control message delete request failed", error);
-    return false;
+  for (const delay of [0, 150, 500]) {
+    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+    try {
+      const response = await fetch(`https://discord.com/api/v10/webhooks/${applicationId}/${token}/messages/@original`, { method: "DELETE" });
+      if (response.ok || response.status === 404) return true;
+      if (![429, 500, 502, 503, 504].includes(response.status)) {
+        console.error("Discord control message delete failed", response.status, await response.text());
+        return false;
+      }
+      if (delay === 500) console.error("Discord control message delete failed after retries", response.status, await response.text());
+    } catch (error) {
+      if (delay === 500) console.error("Discord control message delete request failed after retries", error);
+    }
   }
+  return false;
 }
 
 async function editInteractionOriginal(i: DiscordInteraction, body: Record<string, unknown>): Promise<boolean> {
