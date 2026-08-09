@@ -31,7 +31,9 @@ function buffer(value: Uint8Array): ArrayBuffer {
 }
 
 export function option(interaction: DiscordInteraction, name: string): string | number | boolean | undefined {
-  return interaction.data?.options?.find((item) => item.name === name)?.value;
+  const direct = interaction.data?.options?.find((item) => item.name === name)?.value;
+  if (direct !== undefined || name !== "game") return direct;
+  return interaction.data?.options?.find((item) => item.name === "games")?.value;
 }
 
 export function userId(interaction: DiscordInteraction): string | undefined {
