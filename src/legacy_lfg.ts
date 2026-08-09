@@ -12,11 +12,12 @@ function groupId(guildId: string, gameId: string): string {
 /**
  * Imports LFGs created by the previous Worker during the deployment cutover.
  *
- * Migration 0004 seeded the rows that existed when migrations ran. Migration
- * 0005 retires those source rows before the new Worker is swapped in. Anything
- * written by the old Worker in the small gap is claimed, imported, and retired
- * in one D1 batch. The per-row token makes concurrent reconciliation harmless:
- * only the worker that won the claim can write shared membership state.
+ * Migration 0005 seeds live legacy rows for games that have not entered the
+ * shared model yet, then retires every legacy row visible to that migration.
+ * Anything written by the old Worker in the small deployment gap remains live
+ * here, where it is claimed, imported, and retired exactly once. The per-row
+ * token makes concurrent reconciliation harmless: only the worker that won the
+ * claim can write shared membership state.
  */
 export async function reconcileLegacyLfgs(db: D1Database): Promise<void> {
   const rows = await db.prepare(`
