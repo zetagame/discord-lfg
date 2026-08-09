@@ -55,6 +55,55 @@ export async function finalizeControlSession(
   return Boolean(result.meta.changes);
 }
 
+export async function restorePreviousControlSession(
+  db: D1Database,
+  guildId: string,
+  gameId: string,
+  userId: string,
+  nonce: string,
+  previous?: LfgControlSession,
+): Promise<void> {
+  if (previous) {
+    await db.prepare(`
+      UPDATE lfg_control_sessions
+      SET nonce = ?, application_id = ?, interaction_token = ?, message_id = ?, updated_at = ?
+      WHERE guild_id = ? AND game_id = ? AND user_id = ? AND nonce = ?
+    `).bind(
+      previous.nonce,
+      previous.applicationId,
+      previous.interactionToken,
+      previous.messageId ?? null,
+      previous.updatedAt,
+      guildId,
+      gameId,
+      userId,
+      nonce,
+    ).run();
+    return;
+  }
+  await db.prepare(`
+    DELETE FROM lfg_control_sessions
+    WHERE guild_id = ? AND game_id = ? AND user_id = ? AND nonce = ?
+  `).bind(guildId, gameId, userId, nonce).run();
+}
+
+export async function refreshControlSessionToken(
+  db: D1Database,
+  guildId: string,
+  gameId: string,
+  userId: string,
+  messageId: string | undefined,
+  applicationId: string | undefined,
+  interactionToken: string,
+): Promise<void> {
+  if (!messageId || !applicationId) return;
+  await db.prepare(`
+    UPDATE lfg_control_sessions
+    SET application_id = ?, interaction_token = ?, updated_at = ?
+    WHERE guild_id = ? AND game_id = ? AND user_id = ? AND message_id = ?
+  `).bind(applicationId, interactionToken, new Date().toISOString(), guildId, gameId, userId, messageId).run();
+}
+
 export async function clearControlSession(
   db: D1Database,
   guildId: string,
