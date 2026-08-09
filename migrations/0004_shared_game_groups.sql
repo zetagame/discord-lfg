@@ -24,8 +24,10 @@ CREATE TABLE IF NOT EXISTS group_members (
 CREATE INDEX IF NOT EXISTS group_members_active
 ON group_members (group_id, expires_at, paused_at);
 
--- Seed one shared group per guild/game from any still-open legacy LFGs.
-INSERT OR IGNORE INTO game_groups (id, guild_id, game_id, channel_id, discord_message_id, created_at)
+-- Seed one shared group per guild/game from any still-open legacy LFGs. New
+-- panels are posted by the new Worker so one legacy multi-game message can never
+-- accidentally become the canonical panel for several games.
+INSERT OR IGNORE INTO game_groups (id, guild_id, game_id, channel_id, created_at)
 SELECT
   l.guild_id || ':' || lg.game_id,
   l.guild_id,
@@ -37,15 +39,6 @@ SELECT
     WHERE l2.guild_id = l.guild_id AND lg2.game_id = lg.game_id
       AND l2.stopped_at IS NULL AND julianday(l2.expires_at) > julianday('now')
     ORDER BY l2.created_at DESC LIMIT 1
-  ),
-  (
-    SELECT l3.discord_message_id
-    FROM lfgs l3
-    JOIN lfg_games lg3 ON lg3.lfg_id = l3.id
-    WHERE l3.guild_id = l.guild_id AND lg3.game_id = lg.game_id
-      AND l3.stopped_at IS NULL AND julianday(l3.expires_at) > julianday('now')
-      AND l3.discord_message_id IS NOT NULL
-    ORDER BY l3.created_at DESC LIMIT 1
   ),
   CURRENT_TIMESTAMP
 FROM lfgs l
