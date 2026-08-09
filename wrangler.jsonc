@@ -1,7 +1,7 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "discord-lfg",
-  "main": "src/temp-register.ts",
+  "main": "src/index.ts",
   "compatibility_date": "2026-08-08",
   "triggers": {
     "crons": ["*/5 * * * *"]
