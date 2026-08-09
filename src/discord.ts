@@ -1,7 +1,7 @@
 import type { DiscordInteraction } from "./types";
 
-export const InteractionType = { Ping: 1, ApplicationCommand: 2, Component: 3, Autocomplete: 4 } as const;
-export const ResponseType = { Pong: 1, ChannelMessage: 4, Autocomplete: 8, UpdateMessage: 7 } as const;
+export const InteractionType = { Ping: 1, ApplicationCommand: 2, Component: 3, Autocomplete: 4, ModalSubmit: 5 } as const;
+export const ResponseType = { Pong: 1, ChannelMessage: 4, Autocomplete: 8, UpdateMessage: 7, Modal: 9 } as const;
 
 export function json(body: unknown): Response {
   return new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
