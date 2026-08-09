@@ -11,6 +11,12 @@ test("scheduled local time is stored as UTC", () => {
   assert.equal(parseWhen("2026-01-15 20:00", "America/New_York")?.toISOString(), "2026-01-16T01:00:00.000Z");
 });
 
+test("tomorrow night resolves to 8pm local time", () => {
+  const now = new Date("2026-08-09T17:00:00.000Z"); // 1pm EDT
+  assert.equal(parseWhen("tomorrow night", "America/New_York", now)?.toISOString(), "2026-08-11T00:00:00.000Z");
+  assert.equal(parseWhen("tomorrow at 9:30pm", "America/New_York", now)?.toISOString(), "2026-08-11T01:30:00.000Z");
+});
+
 test("bare date without time is rejected", () => {
   assert.equal(parseWhen("2026-08-10", "America/New_York"), undefined);
 });

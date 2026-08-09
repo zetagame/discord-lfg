@@ -1,10 +1,36 @@
 export type RsvpStatus = "yes" | "maybe" | "no";
 export type EventDeliveryKind = "reminder" | "start" | "activation";
+export type RsvpTriggerType = "yes_rsvps" | "yes-or-maybe_rsvps";
 
 export function dueDeliveries(startsAt: Date, status: RsvpStatus, now: Date): EventDeliveryKind[] {
   if (status === "no") return [];
   if (now >= startsAt) return status === "yes" ? ["start"] : [];
   return startsAt.getTime() - 3_600_000 <= now.getTime() ? ["reminder"] : [];
+}
+
+export function minimumPlayersCheckDue(startsAt: Date, now: Date): boolean {
+  const remaining = startsAt.getTime() - now.getTime();
+  return remaining > 0 && remaining <= 30 * 60_000;
+}
+
+export function parseRsvpTrigger(value: string): { type: RsvpTriggerType; threshold: number } | undefined {
+  const normalized = value.trim().toLowerCase().replace(/\s+/g, " ");
+  const match = /^(\d+)\s+(.+)$/.exec(normalized);
+  if (!match) return undefined;
+  const threshold = Number(match[1]);
+  if (!Number.isInteger(threshold) || threshold < 1) return undefined;
+
+  const phrase = match[2]!
+    .replace(/\brsvps?\b/g, "")
+    .trim()
+    .replace(/\s*-\s*/g, "-");
+  if (["yes", "players", "player", "people", "person"].includes(phrase)) {
+    return { type: "yes_rsvps", threshold };
+  }
+  if (["yes-or-maybe", "yes or maybe", "yes/maybe"].includes(phrase)) {
+    return { type: "yes-or-maybe_rsvps", threshold };
+  }
+  return undefined;
 }
 
 export async function eventIsActive(db: D1Database, eventId: string): Promise<boolean> {
@@ -36,6 +62,49 @@ export async function releaseEventDeliveryClaim(
 ): Promise<void> {
   await db.prepare("DELETE FROM event_deliveries WHERE event_id = ? AND user_id = ? AND kind = ?")
     .bind(eventId, userId, kind).run();
+}
+
+export async function claimMinimumPlayerCheck(
+  db: D1Database,
+  eventId: string,
+  now = new Date(),
+): Promise<number | undefined> {
+  const nowIso = now.toISOString();
+  await db.prepare(`
+    INSERT OR IGNORE INTO event_min_player_checks (event_id, checked_at, yes_count)
+    SELECT events.id, ?, (
+      SELECT COUNT(*) FROM rsvps WHERE rsvps.event_id = events.id AND rsvps.status = 'yes'
+    )
+    FROM events
+    WHERE events.id = ?
+      AND events.deleted_at IS NULL
+      AND events.starts_at IS NOT NULL
+      AND events.min_players IS NOT NULL
+      AND julianday(events.starts_at) > julianday(?)
+      AND julianday(events.starts_at) <= julianday(?, '+30 minutes')
+  `).bind(nowIso, eventId, nowIso, nowIso).run();
+
+  const check = await db.prepare(`
+    SELECT event_min_player_checks.yes_count AS yesCount,
+      event_min_player_checks.alerted_at AS alertedAt
+    FROM event_min_player_checks
+    JOIN events ON events.id = event_min_player_checks.event_id
+    WHERE event_min_player_checks.event_id = ?
+      AND events.deleted_at IS NULL
+      AND events.starts_at IS NOT NULL
+      AND julianday(events.starts_at) > julianday(?)
+  `).bind(eventId, nowIso).first<{ yesCount: number; alertedAt?: string }>();
+  return check && !check.alertedAt ? check.yesCount : undefined;
+}
+
+export async function markMinimumPlayerAlerted(db: D1Database, eventId: string, now = new Date()): Promise<void> {
+  await db.prepare("UPDATE event_min_player_checks SET alerted_at = ? WHERE event_id = ? AND alerted_at IS NULL")
+    .bind(now.toISOString(), eventId).run();
+}
+
+export async function releaseMinimumPlayerCheck(_db: D1Database, _eventId: string): Promise<void> {
+  // The stored Yes-RSVP snapshot is the idempotency key for this check. Keep it
+  // across delivery failures so retries do not silently change the 30-minute observation.
 }
 
 export async function fireRsvpTrigger(db: D1Database, eventId: string, now = new Date()): Promise<boolean> {
