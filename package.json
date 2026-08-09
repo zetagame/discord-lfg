@@ -1,0 +1,23 @@
+{
+  "name": "discord-lfg",
+  "version": "1.0.0",
+  "description": "A minimal Discord LFG bot for Cloudflare Workers",
+  "private": true,
+  "scripts": {
+    "check": "tsc",
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "repository": {
+    "type": "git",
+    "url": "http://localhost:26831/zetagame/discord-lfg"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260808.1",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.120.0"
+  }
+}
