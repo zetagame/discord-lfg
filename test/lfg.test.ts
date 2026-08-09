@@ -1,35 +1,31 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { lfgState, type LfgRecord } from "../src/lfg";
+import { groupMemberState, type GroupMember } from "../src/lfg";
 
-const base: LfgRecord = {
-  id: "lfg",
-  guildId: "guild",
-  channelId: "channel",
-  authorId: "user",
+const base: GroupMember = {
+  userId: "user",
   expiresAt: "2026-08-09T12:00:00.000Z",
 };
 
 const beforeExpiry = new Date("2026-08-09T11:00:00.000Z").getTime();
 
-test("active LFG is available", () => {
-  assert.equal(lfgState(base, beforeExpiry), "active");
+test("active member is in the group", () => {
+  assert.equal(groupMemberState(base, beforeExpiry), "active");
 });
 
-test("pause changes active LFG state without changing expiry", () => {
+test("paused member is not active and keeps the same expiry", () => {
   const paused = { ...base, pausedAt: "2026-08-09T10:30:00.000Z" };
-  assert.equal(lfgState(paused, beforeExpiry), "paused");
+  assert.equal(groupMemberState(paused, beforeExpiry), "paused");
   assert.equal(paused.expiresAt, base.expiresAt);
 });
 
-test("stopped state wins over paused state", () => {
-  assert.equal(lfgState({
-    ...base,
-    pausedAt: "2026-08-09T10:30:00.000Z",
-    stoppedAt: "2026-08-09T10:45:00.000Z",
-  }, beforeExpiry), "stopped");
+test("membership expires even while paused", () => {
+  assert.equal(
+    groupMemberState({ ...base, pausedAt: "2026-08-09T10:30:00.000Z" }, new Date("2026-08-09T12:00:00.000Z").getTime()),
+    "expired",
+  );
 });
 
-test("window expires even while paused", () => {
-  assert.equal(lfgState({ ...base, pausedAt: "2026-08-09T10:30:00.000Z" }, new Date("2026-08-09T12:00:00.000Z").getTime()), "expired");
+test("missing membership is not in the group", () => {
+  assert.equal(groupMemberState(undefined, beforeExpiry), "missing");
 });

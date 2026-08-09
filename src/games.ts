@@ -34,7 +34,8 @@ export class IgdbProvider implements GameProvider {
   private async accessToken(): Promise<string | undefined> {
     if (this.token && this.token.expiresAt > Date.now() + 60_000) return this.token.value;
     const response = await fetchWithTimeout("https://id.twitch.tv/oauth2/token", {
-      method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({ client_id: this.clientId!, client_secret: this.clientSecret!, grant_type: "client_credentials" }),
     });
     if (!response.ok) return undefined;
@@ -109,7 +110,7 @@ export class GameSelectionService {
       SELECT id FROM games WHERE guild_id = ? AND name = ? AND deleted_at IS NOT NULL
     `).bind(guildId, storedName).first<{ id: string }>();
     if (deleted && !await collectDeletedCustomGame(this.db, deleted.id)) {
-      throw new Error(`**${storedName}** was removed but is still attached to an active LFG or event. Try again after it finishes.`);
+      throw new Error(`**${storedName}** was removed but is still attached to an active group or event. Try again after it finishes.`);
     }
 
     const game = {
@@ -127,20 +128,27 @@ export class GameSelectionService {
       SELECT id, name, provider_id AS providerId, cover_url AS coverUrl, created_by_user_id AS createdByUserId
       FROM games WHERE guild_id = ? AND name = ? AND deleted_at IS NULL
     `).bind(guildId, game.name).first<Game>())!;
-    if (name.toLowerCase() !== stored.name.toLowerCase()) await this.db.prepare("INSERT OR IGNORE INTO game_aliases (guild_id, alias, game_id) VALUES (?, ?, ?)")
-      .bind(guildId, name, stored.id).run();
+    if (name.toLowerCase() !== stored.name.toLowerCase()) {
+      await this.db.prepare("INSERT OR IGNORE INTO game_aliases (guild_id, alias, game_id) VALUES (?, ?, ?)")
+        .bind(guildId, name, stored.id).run();
+    }
     return stored;
   }
 }
 
-async function hasOpenLfg(db: D1Database, gameId: string): Promise<boolean> {
+async function hasOpenGroupMembership(db: D1Database, gameId: string): Promise<boolean> {
   const row = await db.prepare(`
     SELECT 1 AS found
-    FROM lfg_games JOIN lfgs ON lfgs.id = lfg_games.lfg_id
-    WHERE lfg_games.game_id = ? AND lfgs.stopped_at IS NULL
-      AND julianday(lfgs.expires_at) > julianday('now')
+    FROM game_groups JOIN group_members ON group_members.group_id = game_groups.id
+    WHERE game_groups.game_id = ? AND julianday(group_members.expires_at) > julianday('now')
     LIMIT 1
   `).bind(gameId).first<{ found: number }>();
+  return Boolean(row);
+}
+
+async function hasGroupPanel(db: D1Database, gameId: string): Promise<boolean> {
+  const row = await db.prepare("SELECT 1 AS found FROM game_groups WHERE game_id = ? AND discord_message_id IS NOT NULL LIMIT 1")
+    .bind(gameId).first<{ found: number }>();
   return Boolean(row);
 }
 
@@ -163,13 +171,14 @@ export async function collectDeletedCustomGame(db: D1Database, gameId: string): 
   const deleted = await db.prepare("SELECT id FROM games WHERE id = ? AND provider_id IS NULL AND deleted_at IS NOT NULL")
     .bind(gameId).first<{ id: string }>();
   if (!deleted) return false;
-  if (await hasOpenLfg(db, gameId)) return false;
+  if (await hasOpenGroupMembership(db, gameId)) return false;
+  if (await hasGroupPanel(db, gameId)) return false;
   if (await hasActiveEvent(db, gameId)) return false;
 
   await db.batch([
-    db.prepare(`DELETE FROM lfg_games WHERE game_id = ? AND lfg_id IN (
-      SELECT id FROM lfgs WHERE stopped_at IS NOT NULL OR julianday(expires_at) <= julianday('now')
-    )`).bind(gameId),
+    db.prepare("DELETE FROM group_members WHERE group_id IN (SELECT id FROM game_groups WHERE game_id = ?)").bind(gameId),
+    db.prepare("DELETE FROM lfg_overlap_pairs WHERE game_id = ?").bind(gameId),
+    db.prepare("DELETE FROM lfg_games WHERE game_id = ?").bind(gameId),
     db.prepare(`DELETE FROM event_game_votes WHERE game_id = ? AND event_id IN (
       SELECT events.id FROM events LEFT JOIN event_triggers ON event_triggers.event_id = events.id
       WHERE (events.starts_at IS NOT NULL AND julianday(events.starts_at) <= julianday('now'))
@@ -180,14 +189,16 @@ export async function collectDeletedCustomGame(db: D1Database, gameId: string): 
       WHERE (events.starts_at IS NOT NULL AND julianday(events.starts_at) <= julianday('now'))
         OR (events.starts_at IS NULL AND event_triggers.fired_at IS NOT NULL)
     )`).bind(gameId),
+    db.prepare("DELETE FROM game_groups WHERE game_id = ?").bind(gameId),
   ]);
 
   const references = await db.prepare(`
     SELECT
       (SELECT COUNT(*) FROM lfg_games WHERE game_id = ?) +
       (SELECT COUNT(*) FROM event_games WHERE game_id = ?) +
-      (SELECT COUNT(*) FROM event_game_votes WHERE game_id = ?) AS count
-  `).bind(gameId, gameId, gameId).first<{ count: number }>();
+      (SELECT COUNT(*) FROM event_game_votes WHERE game_id = ?) +
+      (SELECT COUNT(*) FROM game_groups WHERE game_id = ?) AS count
+  `).bind(gameId, gameId, gameId, gameId).first<{ count: number }>();
   if ((references?.count ?? 0) > 0) return false;
 
   await db.batch([
