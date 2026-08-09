@@ -20,7 +20,6 @@ import {
   type GroupMember,
   type MembershipUpdate,
 } from "./lfg";
-import { reconcileLegacyLfgs } from "./legacy_lfg";
 import { ResponseType, json, userId } from "./discord";
 import { discordTimestamp } from "./time";
 import type { DiscordInteraction, Env, Game } from "./types";
@@ -35,7 +34,6 @@ export async function handleLfgCommand(
   expiresAt: Date,
   ctx: ExecutionContext,
 ): Promise<Response> {
-  await reconcileLegacyLfgs(env.DB);
   const updates: MembershipUpdate[] = [];
   for (const game of games) {
     updates.push(await upsertGameMembership(env.DB, i.guild_id!, i.channel_id!, actor, game, expiresAt));
@@ -91,8 +89,11 @@ async function completeMemberAction(
   const actor = userId(i)!;
   try {
     const result = await mutateGameMembership(env.DB, i.guild_id!, game.id, actor, action);
-    const finalData = memberControlData(game, result.member);
-    if (!await editInteractionOriginal(i, finalData)) {
+    if (action === "stop") {
+      if (!await deleteInteractionOriginal(i)) {
+        await editInteractionOriginal(i, memberControlData(game, undefined));
+      }
+    } else if (!await editInteractionOriginal(i, memberControlData(game, result.member))) {
       await interactionFollowup(i, "Your LFG state changed, but Discord could not refresh your controls.");
     }
     await syncGamePanel(env, i.guild_id!, game.id, i.channel_id);
@@ -169,18 +170,34 @@ function gamePanelData(snapshot: GameGroupSnapshot): Record<string, unknown> {
   };
 }
 
+function panelEligible(snapshot: GameGroupSnapshot): boolean {
+  return !snapshot.game.deletedAt && (snapshot.activeUserIds.length > 0 || Boolean(snapshot.upcomingEvent));
+}
+
 export async function syncGamePanel(env: Env, guildId: string, gameId: string, preferredChannelId?: string): Promise<void> {
   let snapshot = await loadGameGroupSnapshot(env.DB, guildId, gameId);
   if (!snapshot) return;
-  const eligible = snapshot.activeUserIds.length > 0 || Boolean(snapshot.upcomingEvent);
+  const eligible = panelEligible(snapshot);
   const panelChannel = snapshot.activeUserIds.length > 0
     ? snapshot.group.channelId ?? preferredChannelId ?? snapshot.upcomingEvent?.channelId
     : snapshot.upcomingEvent?.channelId ?? snapshot.group.channelId ?? preferredChannelId;
 
   if (!eligible) {
     if (snapshot.group.discordMessageId && snapshot.group.channelId) {
-      const deleted = await deleteChannelMessage(env, snapshot.group.channelId, snapshot.group.discordMessageId);
-      if (deleted) await clearPanelMessage(env.DB, snapshot.group.id, snapshot.group.discordMessageId);
+      const latest = await loadGameGroupSnapshot(env.DB, guildId, gameId);
+      if (latest && panelEligible(latest)) {
+        await syncGamePanel(env, guildId, gameId, preferredChannelId);
+        return;
+      }
+      const messageId = snapshot.group.discordMessageId;
+      const deleted = await deleteChannelMessage(env, snapshot.group.channelId, messageId);
+      if (deleted) {
+        await clearPanelMessage(env.DB, snapshot.group.id, messageId);
+        const afterDelete = await loadGameGroupSnapshot(env.DB, guildId, gameId);
+        if (afterDelete && panelEligible(afterDelete)) {
+          await syncGamePanel(env, guildId, gameId, preferredChannelId);
+        }
+      }
     }
     return;
   }
@@ -217,7 +234,6 @@ export async function syncGamePanel(env: Env, guildId: string, gameId: string, p
 }
 
 export async function syncSharedGameGroups(env: Env): Promise<void> {
-  await reconcileLegacyLfgs(env.DB);
   await pruneExpiredGroupMembers(env.DB);
   await ensureGroupsForUpcomingEvents(env.DB);
   await retireLegacyLfgCards(env);
@@ -326,6 +342,20 @@ async function editInteractionOriginal(i: DiscordInteraction, body: Record<strin
     return response.ok;
   } catch (error) {
     console.error("Discord interaction edit request failed", error);
+    return false;
+  }
+}
+
+async function deleteInteractionOriginal(i: DiscordInteraction): Promise<boolean> {
+  if (!i.application_id) return false;
+  try {
+    const response = await fetch(`https://discord.com/api/v10/webhooks/${i.application_id}/${i.token}/messages/@original`, {
+      method: "DELETE",
+    });
+    if (!response.ok && response.status !== 404) console.error("Discord interaction delete failed", response.status, await response.text());
+    return response.ok || response.status === 404;
+  } catch (error) {
+    console.error("Discord interaction delete request failed", error);
     return false;
   }
 }
