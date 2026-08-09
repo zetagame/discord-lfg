@@ -1,4 +1,11 @@
 export type NotificationAction = "listen" | "unlisten";
+export interface NotificationInstruction { action: NotificationAction; createdAt: Date; expiresAt?: Date; }
+
+export function effectiveNotificationAction(instructions: NotificationInstruction[], now = new Date()): NotificationAction | undefined {
+  return instructions
+    .filter((instruction) => !instruction.expiresAt || instruction.expiresAt > now)
+    .sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime())[0]?.action;
+}
 
 export async function recordNotificationAction(
   db: D1Database, guildId: string, userId: string, gameIds: string[], action: NotificationAction, expiresAt?: Date,

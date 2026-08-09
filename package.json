@@ -5,8 +5,12 @@
   "private": true,
   "scripts": {
     "check": "tsc",
+    "typecheck": "tsc",
     "deploy": "wrangler deploy",
-    "dev": "wrangler dev"
+    "dev": "wrangler dev",
+    "test": "tsx --test test/*.test.ts",
+    "migrations": "wrangler d1 migrations apply discord-lfg --local",
+    "register-commands": "node scripts/register-commands.mjs"
   },
   "repository": {
     "type": "git",
