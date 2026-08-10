@@ -200,7 +200,10 @@ async function gamePanelData(env: Env, snapshot: GameGroupSnapshot, signal: Abor
         primary,
         {
           type: 1,
-          components: [{ type: 2, style: 2, label: "Manage my LFG", custom_id: `group:manage:${snapshot.game.id}` }],
+          components: [
+            { type: 2, style: 3, label: "Join", custom_id: `group:join:${snapshot.game.id}` },
+            { type: 2, style: 2, label: "Manage my LFG", custom_id: `group:manage:${snapshot.game.id}` },
+          ],
         },
       ],
     }],
