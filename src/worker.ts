@@ -1,5 +1,6 @@
 import worker from "./index";
-import { InteractionType, ResponseType } from "./discord";
+import { currentControlMessageForInteraction, rebindControlSessionMessage } from "./control_sessions";
+import { InteractionType, ResponseType, userId } from "./discord";
 import type { DiscordInteraction, Env } from "./types";
 
 const ACK_BUDGET_MS = 1_750;
@@ -9,8 +10,8 @@ const IS_COMPONENTS_V2 = 1 << 15;
 type DeferredSpec = {
   type: typeof ResponseType.DeferredChannelMessage | typeof ResponseType.DeferredUpdateMessage;
   flags?: number;
-  ignoreUpdateResult?: boolean;
   recreateAfterCompletion?: boolean;
+  forceDeferred?: boolean;
 };
 
 type CallbackResponse = {
@@ -19,8 +20,8 @@ type CallbackResponse = {
 };
 
 type SettledResponse =
-  | { ok: true; response: Response }
-  | { ok: false; error: unknown };
+  | { response: Response; error?: never }
+  | { response?: never; error: unknown };
 
 async function registerCommands(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   if (!env.DISCORD_BOT_TOKEN) return new Response("DISCORD_BOT_TOKEN is missing.", { status: 500 });
@@ -82,13 +83,16 @@ function deferredSpec(interaction: DiscordInteraction): DeferredSpec | undefined
       return { type: ResponseType.DeferredChannelMessage, flags: EPHEMERAL | IS_COMPONENTS_V2 };
     }
     if (sub === "pause" || sub === "resume" || sub === "stop") {
-      return { type: ResponseType.DeferredUpdateMessage, ignoreUpdateResult: true };
+      return { type: ResponseType.DeferredUpdateMessage };
     }
     return { type: ResponseType.DeferredChannelMessage, flags: EPHEMERAL };
   }
 
+  // Event deletion still performs its destructive write in the existing
+  // completion task. Always acknowledge it as processing until that path is
+  // fully synchronous with this boundary; never mislabel its preflight as done.
   if (action === "event-delete") {
-    return { type: ResponseType.DeferredUpdateMessage, ignoreUpdateResult: true };
+    return { type: ResponseType.DeferredUpdateMessage, forceDeferred: true };
   }
   if (action === "rsvp") return { type: ResponseType.DeferredUpdateMessage };
   return { type: ResponseType.DeferredChannelMessage, flags: EPHEMERAL };
@@ -97,15 +101,22 @@ function deferredSpec(interaction: DiscordInteraction): DeferredSpec | undefined
 async function withAckBudget(
   interaction: DiscordInteraction,
   operation: Promise<Response>,
+  env: Env,
   ctx: ExecutionContext,
 ): Promise<Response> {
   const spec = deferredSpec(interaction);
   if (!spec) return operation;
 
   const settled: Promise<SettledResponse> = operation.then(
-    (response) => ({ ok: true as const, response }),
-    (error) => ({ ok: false as const, error }),
+    (response) => ({ response }),
+    (error) => ({ error }),
   );
+
+  if (spec.forceDeferred) {
+    ctx.waitUntil(finalizeDeferred(interaction, settled, spec, env));
+    return deferredResponse(spec);
+  }
+
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<undefined>((resolve) => {
     timer = setTimeout(() => resolve(undefined), ACK_BUDGET_MS);
@@ -114,7 +125,7 @@ async function withAckBudget(
   if (timer) clearTimeout(timer);
 
   if (fast) {
-    if (fast.ok) return fast.response;
+    if ("response" in fast) return fast.response;
     console.error("Discord interaction failed before acknowledgement", fast.error);
     return Response.json({
       type: ResponseType.ChannelMessage,
@@ -122,7 +133,11 @@ async function withAckBudget(
     });
   }
 
-  ctx.waitUntil(finalizeDeferred(interaction, settled, spec));
+  ctx.waitUntil(finalizeDeferred(interaction, settled, spec, env));
+  return deferredResponse(spec);
+}
+
+function deferredResponse(spec: DeferredSpec): Response {
   return Response.json({
     type: spec.type,
     ...(spec.type === ResponseType.DeferredChannelMessage && spec.flags !== undefined
@@ -135,9 +150,10 @@ async function finalizeDeferred(
   interaction: DiscordInteraction,
   settled: Promise<SettledResponse>,
   spec: DeferredSpec,
+  env: Env,
 ): Promise<void> {
   const result = await settled;
-  if (!result.ok) {
+  if ("error" in result) {
     console.error("Discord interaction failed after deferred acknowledgement", result.error);
     await finishDeferredError(interaction, spec);
     return;
@@ -155,7 +171,7 @@ async function finalizeDeferred(
   const data = callback.data ?? {};
   if (spec.type === ResponseType.DeferredUpdateMessage) {
     if (callback.type === ResponseType.UpdateMessage) {
-      if (!spec.ignoreUpdateResult) await editInteractionOriginal(interaction, data);
+      await editInteractionOriginal(interaction, data);
       return;
     }
     if (callback.type === ResponseType.ChannelMessage) {
@@ -166,11 +182,7 @@ async function finalizeDeferred(
 
   if (spec.type === ResponseType.DeferredChannelMessage && callback.type === ResponseType.ChannelMessage) {
     if (spec.recreateAfterCompletion) {
-      // A deferred response message is created when we ACK, before /lfg has
-      // finished projecting its public panel. Recreate the final manager only
-      // after projection completes so it is chronologically below that panel.
-      await deleteInteractionOriginal(interaction);
-      await postInteractionFollowup(interaction, data);
+      await recreateDeferredLfgManager(interaction, data, env);
       return;
     }
     const finalFlags = typeof data.flags === "number" ? data.flags : 0;
@@ -188,6 +200,56 @@ async function finalizeDeferred(
 
   console.error("Deferred interaction callback type did not match acknowledgement mode", callback.type, spec.type);
   await finishDeferredError(interaction, spec);
+}
+
+async function recreateDeferredLfgManager(
+  interaction: DiscordInteraction,
+  data: Record<string, unknown>,
+  env: Env,
+): Promise<void> {
+  const guildId = interaction.guild_id;
+  const actor = userId(interaction);
+  if (!guildId || !actor) {
+    const { flags: _flags, ...editable } = data;
+    await editInteractionOriginal(interaction, editable);
+    return;
+  }
+
+  // handleLfgCommand promotes the original deferred message into the durable
+  // control session after Discord creates it. Wait for that promotion before
+  // replacing the placeholder so session ownership can move atomically to the
+  // final follow-up message.
+  let originalManagerId: string | undefined;
+  for (const delay of [0, 50, 100, 250, 500, 750]) {
+    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+    originalManagerId = await currentControlMessageForInteraction(env.DB, guildId, actor, interaction.token);
+    if (originalManagerId) break;
+  }
+  if (!originalManagerId) {
+    console.error("Deferred /lfg manager session was not promoted in time; preserving original manager");
+    const { flags: _flags, ...editable } = data;
+    await editInteractionOriginal(interaction, editable);
+    return;
+  }
+
+  if (!await deleteInteractionOriginal(interaction)) {
+    const { flags: _flags, ...editable } = data;
+    await editInteractionOriginal(interaction, editable);
+    return;
+  }
+
+  const finalMessageId = await postInteractionFollowupMessage(interaction, data);
+  if (!finalMessageId) return;
+  if (!await rebindControlSessionMessage(
+    env.DB,
+    guildId,
+    actor,
+    interaction.token,
+    originalManagerId,
+    finalMessageId,
+  )) {
+    console.error("Deferred /lfg manager was created but its control session could not be rebound");
+  }
 }
 
 async function finishDeferredError(interaction: DiscordInteraction, spec: DeferredSpec): Promise<void> {
@@ -236,18 +298,31 @@ async function deleteInteractionOriginal(interaction: DiscordInteraction): Promi
 }
 
 async function postInteractionFollowup(interaction: DiscordInteraction, data: Record<string, unknown>): Promise<boolean> {
-  if (!interaction.application_id) return false;
+  return Boolean(await postInteractionFollowupMessage(interaction, data));
+}
+
+async function postInteractionFollowupMessage(
+  interaction: DiscordInteraction,
+  data: Record<string, unknown>,
+): Promise<string | undefined> {
+  if (!interaction.application_id) return undefined;
   try {
-    const response = await fetch(`https://discord.com/api/v10/webhooks/${interaction.application_id}/${interaction.token}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(data),
-    });
-    if (!response.ok) console.error("Deferred interaction followup failed", response.status, await response.text());
-    return response.ok;
+    const response = await fetch(
+      `https://discord.com/api/v10/webhooks/${interaction.application_id}/${interaction.token}?wait=true`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(data),
+      },
+    );
+    if (!response.ok) {
+      console.error("Deferred interaction followup failed", response.status, await response.text());
+      return undefined;
+    }
+    return (await response.json() as { id?: string }).id;
   } catch (error) {
     console.error("Deferred interaction followup request failed", error);
-    return false;
+    return undefined;
   }
 }
 
@@ -268,7 +343,7 @@ export default {
     if (interaction.type === InteractionType.Ping || interaction.type === InteractionType.Autocomplete) {
       return worker.fetch(request, env, ctx);
     }
-    return withAckBudget(interaction, worker.fetch(request, env, ctx), ctx);
+    return withAckBudget(interaction, worker.fetch(request, env, ctx), env, ctx);
   },
   scheduled: worker.scheduled,
 } satisfies ExportedHandler<Env>;
