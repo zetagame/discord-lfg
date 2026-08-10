@@ -19,8 +19,8 @@ type CallbackResponse = {
 };
 
 type SettledResponse =
-  | { response: Response; error?: never }
-  | { response?: never; error: unknown };
+  | { ok: true; response: Response }
+  | { ok: false; error: unknown };
 
 async function registerCommands(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   if (!env.DISCORD_BOT_TOKEN) return new Response("DISCORD_BOT_TOKEN is missing.", { status: 500 });
@@ -103,8 +103,8 @@ async function withAckBudget(
   if (!spec) return operation;
 
   const settled: Promise<SettledResponse> = operation.then(
-    (response) => ({ response }),
-    (error) => ({ error }),
+    (response) => ({ ok: true as const, response }),
+    (error) => ({ ok: false as const, error }),
   );
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<undefined>((resolve) => {
@@ -114,7 +114,7 @@ async function withAckBudget(
   if (timer) clearTimeout(timer);
 
   if (fast) {
-    if ("response" in fast) return fast.response;
+    if (fast.ok) return fast.response;
     console.error("Discord interaction failed before acknowledgement", fast.error);
     return Response.json({
       type: ResponseType.ChannelMessage,
@@ -142,7 +142,7 @@ async function finalizeDeferred(
   env: Env,
 ): Promise<void> {
   const result = await settled;
-  if ("error" in result) {
+  if (!result.ok) {
     console.error("Discord interaction failed after deferred acknowledgement", result.error);
     await finishDeferredError(interaction, spec);
     return;
