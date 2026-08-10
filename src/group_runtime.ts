@@ -123,6 +123,16 @@ async function joinFromPanel(
   `).bind(gameId, i.guild_id).first<Game>();
   if (!game) return ephemeral("That game is no longer available.");
 
+  const current = await env.DB.prepare(`
+    SELECT group_members.expires_at AS expiresAt, group_members.paused_at AS pausedAt
+    FROM game_groups
+    JOIN group_members ON group_members.group_id = game_groups.id
+    WHERE game_groups.guild_id = ? AND game_groups.game_id = ? AND group_members.user_id = ?
+  `).bind(i.guild_id, gameId, actor).first<{ expiresAt: string; pausedAt?: string }>();
+  if (current && !current.pausedAt && Date.parse(current.expiresAt) > Date.now()) {
+    return ephemeral(`You’re already in the **${game.name}** LFG until ${discordTimestamp(new Date(current.expiresAt))}.`);
+  }
+
   try {
     const update = await upsertGameMembership(
       env.DB,
