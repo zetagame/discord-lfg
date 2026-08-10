@@ -43,14 +43,21 @@ export async function handleLfgCommand(
   }
   if (!updates.length) return ephemeral("Choose at least one game.");
 
-  // Membership is durable before projection. Await the public projection only
-  // because a newly-created panel must appear before the private manager.
-  await Promise.all(updates.map((update) => projectGamePanelAfterWrite(
-    env,
-    update.snapshot.group.guildId,
-    update.snapshot.game.id,
-    i.channel_id,
-  ).catch((error) => console.error("Write-complete LFG panel projection failed", error))));
+  // Only creation affects chronological ordering. Existing public panels keep
+  // their place in the channel, so their absolute-state PATCH can reconcile in
+  // the background while the manager opens immediately.
+  const requiredProjections: Promise<void>[] = [];
+  for (const update of updates) {
+    const projection = projectGamePanelAfterWrite(
+      env,
+      update.snapshot.group.guildId,
+      update.snapshot.game.id,
+      i.channel_id,
+    ).catch((error) => console.error("Write-complete LFG panel projection failed", error));
+    if (update.snapshot.group.discordMessageId) ctx.waitUntil(projection);
+    else requiredProjections.push(projection);
+  }
+  await Promise.all(requiredProjections);
 
   const manager = await loadManagedLfgs(env.DB, i.guild_id!, actor);
   const session = i.application_id
