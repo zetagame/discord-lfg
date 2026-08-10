@@ -23,6 +23,7 @@ import type { DiscordInteraction, Env, Game } from "./types";
 const IS_COMPONENTS_V2 = 1 << 15;
 const EPHEMERAL = 1 << 6;
 const MAX_MANAGER_ROWS = 6;
+const DEFAULT_JOIN_DURATION_MS = 2 * 60 * 60_000;
 
 type ManagerAction = "pause" | "resume" | "stop";
 type ManagedLfg = { game: Game; member: GroupMember };
@@ -43,9 +44,6 @@ export async function handleLfgCommand(
   }
   if (!updates.length) return ephemeral("Choose at least one game.");
 
-  // Only creation affects chronological ordering. Existing public panels keep
-  // their place in the channel, so their absolute-state PATCH can reconcile in
-  // the background while the manager opens immediately.
   const requiredProjections: Promise<void>[] = [];
   for (const update of updates) {
     const projection = projectGamePanelAfterWrite(
@@ -87,14 +85,16 @@ async function afterMembershipUpdates(
 
 export async function handleGroupComponent(i: DiscordInteraction, env: Env, ctx: ExecutionContext): Promise<Response> {
   const parts = i.data?.custom_id?.split(":") ?? [];
-  const action = parts[1] as "manage" | ManagerAction | "busy" | undefined;
+  const action = parts[1] as "join" | "manage" | ManagerAction | "busy" | undefined;
   const gameId = parts[2];
   const actor = userId(i);
   if (!i.guild_id || !actor || !gameId || !action || action === "busy") return ephemeral("This group action is not available.");
 
+  if (action === "join") return joinFromPanel(env, i, gameId, actor, ctx);
+
   if (action === "manage") {
     const manager = await loadManagedLfgs(env.DB, i.guild_id, actor);
-    if (!manager.length) return ephemeral("You don't have any active LFGs. Use /lfg to start one.");
+    if (!manager.length) return ephemeral("You aren’t part of an active LFG. Click **Join** on a game panel, or use `/lfg` to start one.");
     if (!i.application_id) return ephemeral("Could not open your LFG controls.");
     const session = await beginControlSession(env.DB, i.guild_id, actor, i.application_id, i.token);
     if (!session) return ephemeral("Your LFG controls are already opening.");
@@ -105,10 +105,40 @@ export async function handleGroupComponent(i: DiscordInteraction, env: Env, ctx:
     });
   }
 
-  // mutateGameMembership is the authoritative precondition check. Do not build a
-  // public snapshot or reread the manager merely to validate a button before the
-  // real mutation; that work was the dominant pre-ACK cost of the old path.
   return completeMemberAction(env, i, gameId, action, ctx);
+}
+
+async function joinFromPanel(
+  env: Env,
+  i: DiscordInteraction,
+  gameId: string,
+  actor: string,
+  ctx: ExecutionContext,
+): Promise<Response> {
+  const game = await env.DB.prepare(`
+    SELECT id, name, provider_id AS providerId, cover_url AS coverUrl,
+      created_by_user_id AS createdByUserId, deleted_at AS deletedAt
+    FROM games
+    WHERE id = ? AND guild_id = ? AND deleted_at IS NULL
+  `).bind(gameId, i.guild_id).first<Game>();
+  if (!game) return ephemeral("That game is no longer available.");
+
+  try {
+    const update = await upsertGameMembership(
+      env.DB,
+      i.guild_id!,
+      i.channel_id!,
+      actor,
+      game,
+      new Date(Date.now() + DEFAULT_JOIN_DURATION_MS),
+    );
+    ctx.waitUntil(projectGamePanelAfterWrite(env, i.guild_id!, gameId, i.channel_id)
+      .catch((error) => console.error("Write-complete LFG panel projection failed", error)));
+    ctx.waitUntil(notifyGroupOverlaps(env, i.channel_id!, actor, [update]));
+    return ephemeral(`Looking for **${game.name}** until ${discordTimestamp(new Date(update.member!.expiresAt))}.`);
+  } catch (error) {
+    return ephemeral(error instanceof Error ? error.message : "Could not join that LFG.");
+  }
 }
 
 async function loadManagedLfgs(db: D1Database, guildId: string, actor: string): Promise<ManagedLfg[]> {
@@ -196,8 +226,6 @@ async function completeMemberAction(
 ): Promise<Response> {
   const actor = userId(i)!;
   try {
-    // The real mutation is awaited here so the outer interaction budget can
-    // distinguish "worked" from "still processing" without replaying the write.
     const result = await mutateGameMembership(env.DB, i.guild_id!, gameId, actor, action);
     const manager = await loadManagedLfgs(env.DB, i.guild_id!, actor);
 
@@ -214,9 +242,6 @@ async function completeMemberAction(
       await refreshControlSessionToken(env.DB, i.guild_id!, actor, i.message?.id, i.application_id, i.token);
     }
 
-    // Public Discord projection, overlap notification, and GC are consequences
-    // of an already-committed mutation. Keep them off the interaction success
-    // path; dirty panels remain repairable by reconciliation.
     ctx.waitUntil(projectGamePanelAfterWrite(env, i.guild_id!, gameId, i.channel_id)
       .catch((error) => console.error("Write-complete LFG panel projection failed", error)));
     if (action === "resume") ctx.waitUntil(notifyGroupOverlaps(env, i.channel_id!, actor, [result]));
