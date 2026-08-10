@@ -141,7 +141,14 @@ async function finalizeDeferred(
   spec: DeferredSpec,
   env: Env,
 ): Promise<void> {
-  const result = await settled;
+  const [result, originalReady] = await Promise.all([
+    settled,
+    waitForDeferredOriginal(interaction),
+  ]);
+  if (!originalReady) {
+    console.error("Discord deferred response never became observable; leaving its processing state intact");
+    return;
+  }
   if (!result.ok) {
     console.error("Discord interaction failed after deferred acknowledgement", result.error);
     await finishDeferredError(interaction, spec);
@@ -189,6 +196,25 @@ async function finalizeDeferred(
 
   console.error("Deferred interaction callback type did not match acknowledgement mode", callback.type, spec.type);
   await finishDeferredError(interaction, spec);
+}
+
+async function waitForDeferredOriginal(interaction: DiscordInteraction): Promise<boolean> {
+  if (!interaction.application_id) return false;
+  for (const delay of [0, 50, 100, 250, 500, 1_000, 1_500]) {
+    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+    try {
+      const response = await fetch(
+        `https://discord.com/api/v10/webhooks/${interaction.application_id}/${interaction.token}/messages/@original`,
+      );
+      if (response.ok) return true;
+      if (response.status === 404) continue;
+      console.error("Deferred interaction original lookup failed", response.status, await response.text());
+      return false;
+    } catch (error) {
+      if (delay === 1_500) console.error("Deferred interaction original lookup request failed", error);
+    }
+  }
+  return false;
 }
 
 async function recreateDeferredLfgManager(
