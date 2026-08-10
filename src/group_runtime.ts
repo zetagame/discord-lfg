@@ -10,9 +10,6 @@ import {
 } from "./control_sessions";
 import {
   groupMemberState,
-  loadGameGroup,
-  loadGameGroupSnapshot,
-  loadGroupMember,
   mutateGameMembership,
   upsertGameMembership,
   type GroupMember,
@@ -30,11 +27,6 @@ const MAX_MANAGER_ROWS = 6;
 type ManagerAction = "pause" | "resume" | "stop";
 type ManagedLfg = { game: Game; member: GroupMember };
 
-type LoadingState = {
-  gameId: string;
-  action: ManagerAction;
-};
-
 export { syncGamePanelsForEvent, syncSharedGameGroups } from "./panel_sync";
 
 export async function handleLfgCommand(
@@ -51,16 +43,21 @@ export async function handleLfgCommand(
   }
   if (!updates.length) return ephemeral("Choose at least one game.");
 
-  // The D1 membership write has committed at this point. Start the public
-  // projection immediately and independently from private control bookkeeping.
+  // Only creation affects chronological ordering. Existing public panels keep
+  // their place in the channel, so their absolute-state PATCH can reconcile in
+  // the background while the manager opens immediately.
+  const requiredProjections: Promise<void>[] = [];
   for (const update of updates) {
-    ctx.waitUntil(projectGamePanelAfterWrite(
+    const projection = projectGamePanelAfterWrite(
       env,
       update.snapshot.group.guildId,
       update.snapshot.game.id,
       i.channel_id,
-    ).catch((error) => console.error("Write-complete LFG panel projection failed", error)));
+    ).catch((error) => console.error("Write-complete LFG panel projection failed", error));
+    if (update.snapshot.group.discordMessageId) ctx.waitUntil(projection);
+    else requiredProjections.push(projection);
   }
+  await Promise.all(requiredProjections);
 
   const manager = await loadManagedLfgs(env.DB, i.guild_id!, actor);
   const session = i.application_id
@@ -71,7 +68,7 @@ export async function handleLfgCommand(
   return json({
     type: ResponseType.ChannelMessage,
     data: {
-      ...managerData(manager, undefined, Boolean(session)),
+      ...managerData(manager, Boolean(session)),
       flags: EPHEMERAL | IS_COMPONENTS_V2,
     },
   });
@@ -108,22 +105,10 @@ export async function handleGroupComponent(i: DiscordInteraction, env: Env, ctx:
     });
   }
 
-  const group = await loadGameGroup(env.DB, i.guild_id, gameId);
-  const snapshot = await loadGameGroupSnapshot(env.DB, i.guild_id, gameId);
-  if (!group || !snapshot) return ephemeral("That game group no longer exists.");
-  const member = await loadGroupMember(env.DB, group.id, actor);
-  const state = groupMemberState(member);
-
-  if (action === "pause" && state !== "active") return ephemeral("You are not actively looking for this game.");
-  if (action === "resume" && state !== "paused") return ephemeral("You are not paused for this game.");
-  if (action === "stop" && state !== "active" && state !== "paused") return ephemeral("You are no longer looking for this game.");
-
-  const manager = await loadManagedLfgs(env.DB, i.guild_id, actor);
-  ctx.waitUntil(completeMemberAction(env, i, snapshot.game, action));
-  return json({
-    type: ResponseType.UpdateMessage,
-    data: managerData(manager, { gameId, action }),
-  });
+  // mutateGameMembership is the authoritative precondition check. Do not build a
+  // public snapshot or reread the manager merely to validate a button before the
+  // real mutation; that work was the dominant pre-ACK cost of the old path.
+  return completeMemberAction(env, i, gameId, action, ctx);
 }
 
 async function loadManagedLfgs(db: D1Database, guildId: string, actor: string): Promise<ManagedLfg[]> {
@@ -205,48 +190,48 @@ async function finishControlOpening(
 async function completeMemberAction(
   env: Env,
   i: DiscordInteraction,
-  game: Game,
+  gameId: string,
   action: ManagerAction,
-): Promise<void> {
+  ctx: ExecutionContext,
+): Promise<Response> {
   const actor = userId(i)!;
   try {
-    const result = await mutateGameMembership(env.DB, i.guild_id!, game.id, actor, action);
-    const panelProjection = projectGamePanelAfterWrite(env, i.guild_id!, game.id, i.channel_id)
-      .catch((error) => console.error("Write-complete LFG panel projection failed", error));
+    // The real mutation is awaited here so the outer interaction budget can
+    // distinguish "worked" from "still processing" without replaying the write.
+    const result = await mutateGameMembership(env.DB, i.guild_id!, gameId, actor, action);
     const manager = await loadManagedLfgs(env.DB, i.guild_id!, actor);
 
-    // Keep one authoritative manager alive while any LFG remains. A new manager
-    // supersedes it through the control-session opening path above; only the last
-    // Stop removes the current manager.
     if (!manager.length) {
       const current = await takeControlSession(env.DB, i.guild_id!, actor);
       const clickedMessageId = i.message?.id;
-      if (!await deleteInteractionOriginal(i)) {
-        await editInteractionOriginal(i, managerData([]));
-      }
-      if (current && current.messageId !== clickedMessageId) await deleteStoredControlMessage(current);
+      ctx.waitUntil((async () => {
+        if (!await deleteInteractionOriginal(i)) {
+          await editInteractionOriginal(i, managerData([]));
+        }
+        if (current && current.messageId !== clickedMessageId) await deleteStoredControlMessage(current);
+      })());
     } else {
       await refreshControlSessionToken(env.DB, i.guild_id!, actor, i.message?.id, i.application_id, i.token);
-      if (!await editInteractionOriginal(i, managerData(manager))) {
-        await interactionFollowup(i, "Your LFG state changed, but Discord could not refresh your controls.");
-      }
     }
 
-    await panelProjection;
-    if (action === "resume") await notifyGroupOverlaps(env, i.channel_id!, actor, [result]);
-    if (action === "stop") await collectDeletedCustomGames(env.DB);
+    // Public Discord projection, overlap notification, and GC are consequences
+    // of an already-committed mutation. Keep them off the interaction success
+    // path; dirty panels remain repairable by reconciliation.
+    ctx.waitUntil(projectGamePanelAfterWrite(env, i.guild_id!, gameId, i.channel_id)
+      .catch((error) => console.error("Write-complete LFG panel projection failed", error)));
+    if (action === "resume") ctx.waitUntil(notifyGroupOverlaps(env, i.channel_id!, actor, [result]));
+    if (action === "stop") ctx.waitUntil(collectDeletedCustomGames(env.DB));
+
+    return json({
+      type: ResponseType.UpdateMessage,
+      data: managerData(manager),
+    });
   } catch (error) {
-    const manager = await loadManagedLfgs(env.DB, i.guild_id!, actor);
-    await editInteractionOriginal(i, managerData(manager));
-    await interactionFollowup(i, error instanceof Error ? error.message : "Could not update your LFG state.");
+    return ephemeral(error instanceof Error ? error.message : "Could not update your LFG state.");
   }
 }
 
-function managerData(
-  managed: ManagedLfg[],
-  loading?: LoadingState,
-  showControls = true,
-): Record<string, unknown> {
+function managerData(managed: ManagedLfg[], showControls = true): Record<string, unknown> {
   const visible = managed.slice(0, MAX_MANAGER_ROWS);
   const components: Record<string, unknown>[] = [
     { type: 10, content: "### Your LFGs" },
@@ -254,16 +239,11 @@ function managerData(
 
   for (const [index, { game, member }] of visible.entries()) {
     const state = groupMemberState(member);
-    const loadingThis = loading?.gameId === game.id;
     const primaryLabel = state === "paused" ? "▶ Resume" : "⏸ Pause";
     const primaryAction = state === "paused" ? "resume" : "pause";
-    const status = loadingThis
-      ? loading?.action === "pause" ? "Pausing…"
-        : loading?.action === "resume" ? "Resuming…"
-          : "Stopping…"
-      : state === "paused"
-        ? `Paused until ${discordTimestamp(new Date(member.expiresAt))}`
-        : `Looking until ${discordTimestamp(new Date(member.expiresAt))}`;
+    const status = state === "paused"
+      ? `Paused until ${discordTimestamp(new Date(member.expiresAt))}`
+      : `Looking until ${discordTimestamp(new Date(member.expiresAt))}`;
 
     components.push({
       type: 10,
@@ -275,16 +255,16 @@ function managerData(
         {
           type: 2,
           style: 2,
-          label: loadingThis && loading?.action !== "stop" ? `⏳ ${status}` : primaryLabel,
-          custom_id: loadingThis ? `group:busy:${game.id}` : `group:${primaryAction}:${game.id}`,
-          disabled: loadingThis || !showControls,
+          label: primaryLabel,
+          custom_id: `group:${primaryAction}:${game.id}`,
+          disabled: !showControls,
         },
         {
           type: 2,
           style: 4,
-          label: loadingThis && loading?.action === "stop" ? "⏳ Stopping…" : "■ Stop",
-          custom_id: loadingThis ? `group:busy:${game.id}` : `group:stop:${game.id}`,
-          disabled: loadingThis || !showControls,
+          label: "■ Stop",
+          custom_id: `group:stop:${game.id}`,
+          disabled: !showControls,
         },
       ],
     });
@@ -392,20 +372,6 @@ async function editInteractionOriginal(i: DiscordInteraction, body: Record<strin
 async function deleteInteractionOriginal(i: DiscordInteraction): Promise<boolean> {
   if (!i.application_id) return false;
   return deleteOriginalWebhookMessage(i.application_id, i.token);
-}
-
-async function interactionFollowup(i: DiscordInteraction, content: string): Promise<void> {
-  if (!i.application_id) return;
-  try {
-    const response = await fetch(`https://discord.com/api/v10/webhooks/${i.application_id}/${i.token}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ content, flags: EPHEMERAL }),
-    });
-    if (!response.ok) console.error("Discord interaction followup failed", response.status, await response.text());
-  } catch (error) {
-    console.error("Discord interaction followup request failed", error);
-  }
 }
 
 function ephemeral(content: string): Response {

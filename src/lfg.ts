@@ -61,7 +61,7 @@ export async function ensureGameGroup(
   channelId?: string,
 ): Promise<GameGroup> {
   const id = gameGroupId(guildId, gameId);
-  await db.prepare(`
+  const group = await db.prepare(`
     INSERT INTO game_groups (id, guild_id, game_id, channel_id)
     VALUES (?, ?, ?, ?)
     ON CONFLICT(guild_id, game_id) DO UPDATE SET
@@ -69,8 +69,12 @@ export async function ensureGameGroup(
         WHEN game_groups.discord_message_id IS NULL AND excluded.channel_id IS NOT NULL THEN excluded.channel_id
         ELSE game_groups.channel_id
       END
-  `).bind(id, guildId, gameId, channelId ?? null).run();
-  return (await loadGameGroup(db, guildId, gameId))!;
+    RETURNING id, guild_id AS guildId, game_id AS gameId, channel_id AS channelId,
+      discord_message_id AS discordMessageId, panel_claim_token AS panelClaimToken,
+      panel_claimed_at AS panelClaimedAt
+  `).bind(id, guildId, gameId, channelId ?? null).first<GameGroup>();
+  if (!group) throw new Error("Could not create the game group.");
+  return group;
 }
 
 export async function loadGameGroup(db: D1Database, guildId: string, gameId: string): Promise<GameGroup | undefined> {
@@ -157,16 +161,18 @@ export async function loadGameGroupSnapshot(
   guildId: string,
   gameId: string,
 ): Promise<GameGroupSnapshot | undefined> {
-  const group = await loadGameGroup(db, guildId, gameId);
-  if (!group) return undefined;
-  const game = await loadGame(db, gameId);
-  if (!game) return undefined;
-  const active = await activeUsersByGame(db, guildId, [gameId]);
+  const [group, game, active, upcomingEvent] = await Promise.all([
+    loadGameGroup(db, guildId, gameId),
+    loadGame(db, gameId),
+    activeUsersByGame(db, guildId, [gameId]),
+    upcomingEventForGame(db, guildId, gameId),
+  ]);
+  if (!group || !game) return undefined;
   return {
     group,
     game,
     activeUserIds: active.get(gameId) ?? [],
-    upcomingEvent: await upcomingEventForGame(db, guildId, gameId),
+    upcomingEvent,
   };
 }
 
@@ -271,11 +277,13 @@ export async function upsertGameMembership(
   requestedExpiry: Date,
 ): Promise<MembershipUpdate> {
   const group = await ensureGameGroup(db, guildId, game.id, channelId);
-  await pruneInactiveOverlapPairs(db, guildId, [game.id]);
-  const before = await loadGroupMember(db, group.id, userId);
+  const [, before] = await Promise.all([
+    pruneInactiveOverlapPairs(db, guildId, [game.id]),
+    loadGroupMember(db, group.id, userId),
+  ]);
   const wasActive = groupMemberState(before) === "active";
   const now = new Date().toISOString();
-  await db.prepare(`
+  const member = await db.prepare(`
     INSERT INTO group_members (group_id, user_id, expires_at, paused_at, updated_at)
     VALUES (?, ?, ?, NULL, ?)
     ON CONFLICT(group_id, user_id) DO UPDATE SET
@@ -285,10 +293,14 @@ export async function upsertGameMembership(
       END,
       paused_at = NULL,
       updated_at = excluded.updated_at
-  `).bind(group.id, userId, requestedExpiry.toISOString(), now).run();
-  const member = await loadGroupMember(db, group.id, userId);
-  const recipients = wasActive ? [] : await claimNewOverlaps(db, guildId, game.id, userId);
-  const snapshot = await loadGameGroupSnapshot(db, guildId, game.id);
+    RETURNING user_id AS userId, expires_at AS expiresAt, paused_at AS pausedAt
+  `).bind(group.id, userId, requestedExpiry.toISOString(), now).first<GroupMember>();
+  if (!member) throw new Error("Could not update your LFG membership.");
+
+  const [recipients, snapshot] = await Promise.all([
+    wasActive ? Promise.resolve([] as string[]) : claimNewOverlaps(db, guildId, game.id, userId),
+    loadGameGroupSnapshot(db, guildId, game.id),
+  ]);
   if (!snapshot) throw new Error("Could not load the game group.");
   return { snapshot, member, newlyOverlapping: recipients.length > 0, recipients };
 }
@@ -330,13 +342,16 @@ export async function mutateGameMembership(
     if (!deleted.meta.changes) throw new Error("You are no longer looking for this game.");
   }
 
-  await pruneInactiveOverlapPairs(db, guildId, [gameId]);
-  const recipients = action === "resume" ? await claimNewOverlaps(db, guildId, gameId, userId) : [];
-  const snapshot = await loadGameGroupSnapshot(db, guildId, gameId);
+  if (action !== "resume") await pruneInactiveOverlapPairs(db, guildId, [gameId]);
+  const [recipients, snapshot, updatedMember] = await Promise.all([
+    action === "resume" ? claimNewOverlaps(db, guildId, gameId, userId) : Promise.resolve([] as string[]),
+    loadGameGroupSnapshot(db, guildId, gameId),
+    action === "stop" ? Promise.resolve(undefined) : loadGroupMember(db, group.id, userId),
+  ]);
   if (!snapshot) throw new Error("Could not reload the game group.");
   return {
     snapshot,
-    member: action === "stop" ? undefined : await loadGroupMember(db, group.id, userId),
+    member: updatedMember,
     newlyOverlapping: recipients.length > 0,
     recipients,
   };

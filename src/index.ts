@@ -105,21 +105,31 @@ async function command(i: DiscordInteraction, env: Env, games: GameSelectionServ
   const name = i.data?.name;
   const actor = userId(i)!;
   try {
-    const selected = await games.resolve(i.guild_id!, String(option(i, "game") ?? ""), actor);
-    if (name === "lfg") return lfg(i, env, selected, actor, ctx);
-    if (name === "create") return createEvent(i, env, selected, actor, ctx);
+    // Validate command-local input before resolving a game. A cold IGDB lookup
+    // can consume almost the whole interactive budget and should never precede
+    // an error we can detect locally.
+    if (name === "lfg") return lfg(i, env, games, actor, ctx);
+    if (name === "create") return createEvent(i, env, games, actor, ctx);
   } catch (error) {
     return message(error instanceof Error ? error.message : "Could not complete that command.", true);
   }
   return message("Unknown command.", true);
 }
 
-async function lfg(i: DiscordInteraction, env: Env, games: Game[], actor: string, ctx: ExecutionContext): Promise<Response> {
+async function lfg(
+  i: DiscordInteraction,
+  env: Env,
+  gameSelection: GameSelectionService,
+  actor: string,
+  ctx: ExecutionContext,
+): Promise<Response> {
   const userZone = await userTimeZone(env.DB, i.guild_id!, actor);
   const duration = option(i, "duration")
     ? parseWhen(String(option(i, "duration")), userZone.timeZone)
     : new Date(Date.now() + 2 * 3_600_000);
   if (!duration || duration.getTime() <= Date.now()) return message("Use a future duration such as 30m, 2h, 3d, tonight, or this weekend.", true);
+
+  const games = await gameSelection.resolve(i.guild_id!, String(option(i, "game") ?? ""), actor);
   if (userZone.shouldPrompt) await markTimezonePrompted(env.DB, i.guild_id!, actor);
 
   const response = await handleLfgCommand(i, env, games, actor, duration, ctx);
@@ -127,7 +137,13 @@ async function lfg(i: DiscordInteraction, env: Env, games: Game[], actor: string
   return response;
 }
 
-async function createEvent(i: DiscordInteraction, env: Env, games: Game[], actor: string, ctx: ExecutionContext): Promise<Response> {
+async function createEvent(
+  i: DiscordInteraction,
+  env: Env,
+  gameSelection: GameSelectionService,
+  actor: string,
+  ctx: ExecutionContext,
+): Promise<Response> {
   const userZone = await userTimeZone(env.DB, i.guild_id!, actor);
   const whenInput = String(option(i, "when") ?? "");
   const startsAt = parseWhen(whenInput, userZone.timeZone);
@@ -145,6 +161,8 @@ async function createEvent(i: DiscordInteraction, env: Env, games: Game[], actor
   if (minPlayers !== undefined && !startsAt) {
     return message("Min players requires a scheduled event time so the 30-minute check has a start time.", true);
   }
+
+  const games = await gameSelection.resolve(i.guild_id!, String(option(i, "game") ?? ""), actor);
   if (userZone.shouldPrompt) await markTimezonePrompted(env.DB, i.guild_id!, actor);
 
   const id = crypto.randomUUID();
@@ -169,19 +187,20 @@ async function eventMessageData(
   guildId: string,
   deleting = false,
 ): Promise<Record<string, unknown>> {
-  const event = await db.prepare("SELECT id, title, starts_at, when_input, min_players FROM events WHERE id = ? AND guild_id = ? AND deleted_at IS NULL")
-    .bind(eventId, guildId).first<{ id: string; title: string; starts_at?: string; when_input?: string; min_players?: number }>();
+  const [event, games, rsvps, trigger] = await Promise.all([
+    db.prepare("SELECT id, title, starts_at, when_input, min_players FROM events WHERE id = ? AND guild_id = ? AND deleted_at IS NULL")
+      .bind(eventId, guildId).first<{ id: string; title: string; starts_at?: string; when_input?: string; min_players?: number }>(),
+    db.prepare(`
+      SELECT games.id, games.name, games.provider_id AS providerId, games.cover_url AS coverUrl
+      FROM event_games JOIN games ON games.id = event_games.game_id
+      WHERE event_games.event_id = ? ORDER BY games.name
+    `).bind(eventId).all<Game>(),
+    db.prepare("SELECT user_id, status FROM rsvps WHERE event_id = ? ORDER BY updated_at")
+      .bind(eventId).all<{ user_id: string; status: "yes" | "maybe" | "no" }>(),
+    db.prepare("SELECT type, threshold FROM event_triggers WHERE event_id = ?")
+      .bind(eventId).first<{ type: string; threshold: number }>(),
+  ]);
   if (!event) throw new Error("Event not found.");
-
-  const games = await db.prepare(`
-    SELECT games.id, games.name, games.provider_id AS providerId, games.cover_url AS coverUrl
-    FROM event_games JOIN games ON games.id = event_games.game_id
-    WHERE event_games.event_id = ? ORDER BY games.name
-  `).bind(eventId).all<Game>();
-  const rsvps = await db.prepare("SELECT user_id, status FROM rsvps WHERE event_id = ? ORDER BY updated_at")
-    .bind(eventId).all<{ user_id: string; status: "yes" | "maybe" | "no" }>();
-  const trigger = await db.prepare("SELECT type, threshold FROM event_triggers WHERE event_id = ?")
-    .bind(eventId).first<{ type: string; threshold: number }>();
 
   const byStatus = (status: "yes" | "maybe" | "no") => {
     const users = rsvps.results.filter((rsvp) => rsvp.status === status).map((rsvp) => `<@${rsvp.user_id}>`);
@@ -354,18 +373,35 @@ async function component(i: DiscordInteraction, env: Env, ctx: ExecutionContext)
     `).bind(eventId, i.guild_id).first<{ id: string; authorId: string; channelId: string; deletedAt?: string }>();
     if (!event || event.deletedAt) return message("This event has already been deleted.", true);
     if (event.authorId !== actor && !canManageGuild(i)) return message("Only the event creator or a server manager can delete this event.", true);
-    const deleting = await eventMessageData(env.DB, eventId, i.guild_id, true);
-    ctx.waitUntil(completeEventDelete(env, i, eventId, event.channelId));
-    return json({ type: ResponseType.UpdateMessage, data: deleting });
+
+    try {
+      const result = await env.DB.prepare(`
+        UPDATE events SET deleted_at = ?
+        WHERE id = ? AND guild_id = ? AND deleted_at IS NULL
+      `).bind(new Date().toISOString(), eventId, i.guild_id).run();
+      if (!result.meta.changes) return message("This event has already been deleted.", true);
+    } catch (error) {
+      return message(error instanceof Error ? error.message : "Could not delete that event.", true);
+    }
+
+    ctx.waitUntil(afterEventDelete(env, i, eventId, event.channelId));
+    return json({
+      type: ResponseType.UpdateMessage,
+      data: { content: "Event deleted.", embeds: [], components: [] },
+    });
   }
 
   const [, eventId, status] = parts;
   if (!eventId) return message("Invalid event action.", true);
-  const event = await env.DB.prepare("SELECT id FROM events WHERE id = ? AND guild_id = ? AND deleted_at IS NULL")
-    .bind(eventId, i.guild_id).first();
+  const event = await env.DB.prepare(`
+    SELECT events.id, events.starts_at AS startsAt, event_triggers.fired_at AS firedAt
+    FROM events LEFT JOIN event_triggers ON event_triggers.event_id = events.id
+    WHERE events.id = ? AND events.guild_id = ? AND events.deleted_at IS NULL
+  `).bind(eventId, i.guild_id).first<{ id: string; startsAt?: string; firedAt?: string }>();
   if (!event) return message("This event is not available in this server.", true);
-  if ((action === "rsvp" || action === "vote") && !await eventAcceptsChanges(env.DB, eventId)) {
-    return message("This event is no longer accepting changes.", true);
+  if (action === "rsvp" || action === "vote") {
+    const acceptsChanges = event.startsAt ? new Date(event.startsAt).getTime() > Date.now() : !event.firedAt;
+    if (!acceptsChanges) return message("This event is no longer accepting changes.", true);
   }
 
   if (action === "rsvp" && ["yes", "maybe", "no"].includes(status ?? "")) {
@@ -393,28 +429,7 @@ async function component(i: DiscordInteraction, env: Env, ctx: ExecutionContext)
   return message("Invalid event action.", true);
 }
 
-async function completeEventDelete(env: Env, i: DiscordInteraction, eventId: string, channelId: string): Promise<void> {
-  let deleted = false;
-  try {
-    const result = await env.DB.prepare(`
-      UPDATE events SET deleted_at = ?
-      WHERE id = ? AND guild_id = ? AND deleted_at IS NULL
-    `).bind(new Date().toISOString(), eventId, i.guild_id).run();
-    deleted = Boolean(result.meta.changes);
-  } catch (error) {
-    console.error("Event deletion mutation failed", error);
-    if (i.message?.id && i.guild_id) {
-      try {
-        await editDiscordMessage(env, channelId, i.message.id, await eventMessageData(env.DB, eventId, i.guild_id));
-      } catch {
-        // Nothing safe to restore.
-      }
-    }
-    await interactionFollowup(i, error instanceof Error ? error.message : "Could not delete that event.");
-    return;
-  }
-  if (!deleted) return;
-
+async function afterEventDelete(env: Env, i: DiscordInteraction, eventId: string, channelId: string): Promise<void> {
   try {
     await syncGamePanelsForEvent(env, eventId, false);
   } catch (error) {
@@ -430,17 +445,6 @@ async function completeEventDelete(env: Env, i: DiscordInteraction, eventId: str
   if (i.message?.id) {
     await editDiscordMessage(env, channelId, i.message.id, { content: "Event deleted.", embeds: [], components: [] });
   }
-}
-
-async function eventAcceptsChanges(db: D1Database, eventId: string): Promise<boolean> {
-  const event = await db.prepare(`
-    SELECT events.starts_at, event_triggers.fired_at
-    FROM events LEFT JOIN event_triggers ON event_triggers.event_id = events.id
-    WHERE events.id = ? AND events.deleted_at IS NULL
-  `).bind(eventId).first<{ starts_at?: string; fired_at?: string }>();
-  if (!event) return false;
-  if (event.starts_at) return new Date(event.starts_at).getTime() > Date.now();
-  return !event.fired_at;
 }
 
 async function userTimeZone(db: D1Database, guildId: string, userIdValue: string): Promise<{ timeZone: string; shouldPrompt: boolean }> {
@@ -596,20 +600,6 @@ async function editDiscordMessage(env: Env, channelId: string, messageId: string
   } catch (error) {
     console.error("Discord event message edit request failed", error);
     return false;
-  }
-}
-
-async function interactionFollowup(i: DiscordInteraction, content: string): Promise<void> {
-  if (!i.application_id) return;
-  try {
-    const response = await fetch(`https://discord.com/api/v10/webhooks/${i.application_id}/${i.token}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ content, flags: 64 }),
-    });
-    if (!response.ok) console.error("Discord interaction followup failed", response.status, await response.text());
-  } catch (error) {
-    console.error("Discord interaction followup request failed", error);
   }
 }
 

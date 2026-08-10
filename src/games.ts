@@ -1,6 +1,7 @@
 import type { Game } from "./types";
 
 const IGDB_BUDGET_MS = 2200;
+const IGDB_RESULT_TTL_MS = 5 * 60_000;
 const ANY_GAME_NAME = "Any";
 const ANY_GAME_PROVIDER_ID = "system:any";
 
@@ -11,9 +12,19 @@ export interface GameProvider {
 export class IgdbProvider implements GameProvider {
   constructor(private readonly clientId?: string, private readonly clientSecret?: string) {}
   private token?: { value: string; expiresAt: number };
+  private recentByName = new Map<string, { game: Game; expiresAt: number }>();
 
   async search(query: string): Promise<Game[]> {
-    if (!this.clientId || !this.clientSecret || !query.trim()) return [];
+    const normalized = query.trim().toLowerCase();
+    if (!this.clientId || !this.clientSecret || !normalized) return [];
+
+    // Autocomplete already fetched the selected title in the common command
+    // path. Reuse that exact result in this isolate instead of paying for a
+    // second IGDB round trip when the command resolves the chosen name.
+    const recent = this.recentByName.get(normalized);
+    if (recent && recent.expiresAt > Date.now()) return [recent.game];
+    if (recent) this.recentByName.delete(normalized);
+
     const deadline = Date.now() + IGDB_BUDGET_MS;
     try {
       const access_token = await this.accessToken(deadline);
@@ -31,12 +42,15 @@ export class IgdbProvider implements GameProvider {
         deadline,
       );
       if (!result.response.ok || !result.body) return [];
-      return result.body.map((game) => ({
+      const games = result.body.map((game) => ({
         id: `igdb:${game.id}`,
         name: game.name,
         providerId: String(game.id),
         coverUrl: game.cover?.url?.replace(/^\/\//, "https://"),
       }));
+      const expiresAt = Date.now() + IGDB_RESULT_TTL_MS;
+      for (const game of games) this.recentByName.set(game.name.toLowerCase(), { game, expiresAt });
+      return games;
     } catch {
       return [];
     }

@@ -86,6 +86,44 @@ export async function promoteControlSession(
   return Boolean(result.meta.changes);
 }
 
+export async function currentControlMessageForInteraction(
+  db: D1Database,
+  guildId: string,
+  userId: string,
+  interactionToken: string,
+): Promise<string | undefined> {
+  const row = await db.prepare(`
+    SELECT current_message_id AS messageId
+    FROM lfg_control_sessions
+    WHERE guild_id = ? AND user_id = ? AND current_interaction_token = ?
+  `).bind(guildId, userId, interactionToken).first<{ messageId?: string }>();
+  return row?.messageId;
+}
+
+export async function rebindControlSessionMessage(
+  db: D1Database,
+  guildId: string,
+  userId: string,
+  interactionToken: string,
+  previousMessageId: string,
+  messageId: string,
+): Promise<boolean> {
+  const result = await db.prepare(`
+    UPDATE lfg_control_sessions
+    SET current_message_id = ?, updated_at = ?
+    WHERE guild_id = ? AND user_id = ?
+      AND current_interaction_token = ? AND current_message_id = ?
+  `).bind(
+    messageId,
+    new Date().toISOString(),
+    guildId,
+    userId,
+    interactionToken,
+    previousMessageId,
+  ).run();
+  return Boolean(result.meta.changes);
+}
+
 export async function cancelControlSessionOpening(
   db: D1Database,
   guildId: string,
