@@ -11,7 +11,6 @@ type DeferredSpec = {
   type: typeof ResponseType.DeferredChannelMessage | typeof ResponseType.DeferredUpdateMessage;
   flags?: number;
   recreateAfterCompletion?: boolean;
-  forceDeferred?: boolean;
 };
 
 type CallbackResponse = {
@@ -88,13 +87,9 @@ function deferredSpec(interaction: DiscordInteraction): DeferredSpec | undefined
     return { type: ResponseType.DeferredChannelMessage, flags: EPHEMERAL };
   }
 
-  // Event deletion still performs its destructive write in the existing
-  // completion task. Always acknowledge it as processing until that path is
-  // fully synchronous with this boundary; never mislabel its preflight as done.
-  if (action === "event-delete") {
-    return { type: ResponseType.DeferredUpdateMessage, forceDeferred: true };
+  if (action === "event-delete" || action === "rsvp") {
+    return { type: ResponseType.DeferredUpdateMessage };
   }
-  if (action === "rsvp") return { type: ResponseType.DeferredUpdateMessage };
   return { type: ResponseType.DeferredChannelMessage, flags: EPHEMERAL };
 }
 
@@ -111,12 +106,6 @@ async function withAckBudget(
     (response) => ({ response }),
     (error) => ({ error }),
   );
-
-  if (spec.forceDeferred) {
-    ctx.waitUntil(finalizeDeferred(interaction, settled, spec, env));
-    return deferredResponse(spec);
-  }
-
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<undefined>((resolve) => {
     timer = setTimeout(() => resolve(undefined), ACK_BUDGET_MS);
