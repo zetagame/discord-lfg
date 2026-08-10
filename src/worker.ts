@@ -1,6 +1,7 @@
 import worker from "./index";
 import { currentControlMessageForInteraction, rebindControlSessionMessage } from "./control_sessions";
-import { InteractionType, ResponseType, userId } from "./discord";
+import { debugCommand, handleDebugCommand } from "./debug";
+import { InteractionType, ResponseType, userId, verifyDiscordRequest } from "./discord";
 import type { DiscordInteraction, Env } from "./types";
 
 const ACK_BUDGET_MS = 1_750;
@@ -22,6 +23,13 @@ type SettledResponse =
   | { ok: true; response: Response }
   | { ok: false; error: unknown };
 
+async function commandSchema(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const response = await worker.fetch(new Request(new URL("/commands", request.url), { method: "GET" }), env, ctx);
+  if (!response.ok) return response;
+  const commands = await response.json() as unknown[];
+  return Response.json([...commands, debugCommand]);
+}
+
 async function registerCommands(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   if (!env.DISCORD_BOT_TOKEN) return new Response("DISCORD_BOT_TOKEN is missing.", { status: 500 });
 
@@ -34,11 +42,7 @@ async function registerCommands(request: Request, env: Env, ctx: ExecutionContex
   const application = await applicationResponse.json() as { id?: string };
   if (!application.id) return new Response("Discord application id was missing.", { status: 502 });
 
-  const commandsResponse = await worker.fetch(
-    new Request(new URL("/commands", request.url), { method: "GET" }),
-    env,
-    ctx,
-  );
+  const commandsResponse = await commandSchema(request, env, ctx);
   if (!commandsResponse.ok) return new Response("Could not load command schema.", { status: 500 });
   const commands = await commandsResponse.json();
 
@@ -230,10 +234,6 @@ async function recreateDeferredLfgManager(
     return;
   }
 
-  // handleLfgCommand promotes the original deferred message into the durable
-  // control session after Discord creates it. Wait for that promotion before
-  // replacing the placeholder so session ownership can move atomically to the
-  // final follow-up message.
   let originalManagerId: string | undefined;
   for (const delay of [0, 50, 100, 250, 500, 750]) {
     if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
@@ -344,6 +344,9 @@ async function postInteractionFollowupMessage(
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+    if (request.method === "GET" && url.pathname === "/commands") {
+      return commandSchema(request, env, ctx);
+    }
     if (request.method === "GET" && url.pathname === "/register-commands") {
       return registerCommands(request, env, ctx);
     }
@@ -357,6 +360,11 @@ export default {
     }
     if (interaction.type === InteractionType.Ping || interaction.type === InteractionType.Autocomplete) {
       return worker.fetch(request, env, ctx);
+    }
+    if (interaction.type === InteractionType.ApplicationCommand && interaction.data?.name === "debug") {
+      const verified = await verifyDiscordRequest(request.clone(), env.DISCORD_PUBLIC_KEY);
+      if (!verified) return new Response("Invalid request signature", { status: 401 });
+      return withAckBudget(verified, handleDebugCommand(verified, env), env, ctx);
     }
     return withAckBudget(interaction, worker.fetch(request, env, ctx), env, ctx);
   },
