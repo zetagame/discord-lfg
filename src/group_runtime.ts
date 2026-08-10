@@ -94,7 +94,7 @@ export async function handleGroupComponent(i: DiscordInteraction, env: Env, ctx:
 
   if (action === "manage") {
     const manager = await loadManagedLfgs(env.DB, i.guild_id, actor);
-    if (!manager.length) return ephemeral("You don't have any active LFGs. Use /lfg to start one.");
+    if (!manager.length) return ephemeral("You aren’t part of an active LFG. Click **Join** on a game panel, or use `/lfg` to start one.");
     if (!i.application_id) return ephemeral("Could not open your LFG controls.");
     const session = await beginControlSession(env.DB, i.guild_id, actor, i.application_id, i.token);
     if (!session) return ephemeral("Your LFG controls are already opening.");
