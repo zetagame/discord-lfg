@@ -4,6 +4,7 @@ const IGDB_BUDGET_MS = 2200;
 const IGDB_RESULT_TTL_MS = 5 * 60_000;
 const ANY_GAME_NAME = "Any";
 const ANY_GAME_PROVIDER_ID = "system:any";
+const CUSTOM_UI_PROVIDER_ID = "ui:custom";
 
 export interface GameProvider {
   search(query: string): Promise<Game[]>;
@@ -18,9 +19,6 @@ export class IgdbProvider implements GameProvider {
     const normalized = query.trim().toLowerCase();
     if (!this.clientId || !this.clientSecret || !normalized) return [];
 
-    // Autocomplete already fetched the selected title in the common command
-    // path. Reuse that exact result in this isolate instead of paying for a
-    // second IGDB round trip when the command resolves the chosen name.
     const recent = this.recentByName.get(normalized);
     if (recent && recent.expiresAt > Date.now()) return [recent.game];
     if (recent) this.recentByName.delete(normalized);
@@ -108,13 +106,21 @@ export class GameSelectionService {
       .bind(guildId, `%${query}%`, `%${query}%`)
       .all<Game>();
     const external = cached.results.length >= 20 ? [] : await this.provider.search(query);
-    return [...cached.results, ...external.filter((game) => !cached.results.some((cachedGame) => cachedGame.name.toLowerCase() === game.name.toLowerCase()))].slice(0, 20);
+    const results = [...cached.results, ...external.filter((game) => !cached.results.some((cachedGame) => cachedGame.name.toLowerCase() === game.name.toLowerCase()))].slice(0, 20);
+    if (query && !results.some((game) => game.name.toLowerCase() === query.toLowerCase())) {
+      results.push({ id: "custom", name: query, providerId: CUSTOM_UI_PROVIDER_ID });
+    }
+    return results;
   }
 
   async resolve(guildId: string, input: string, createdByUserId?: string): Promise<Game[]> {
     const name = input.trim();
     if (!name || name.toLowerCase() === ANY_GAME_NAME.toLowerCase()) return [await this.resolveAny(guildId)];
-    return [await this.resolveOne(guildId, name, createdByUserId)];
+    const game = await this.resolveOne(guildId, name, createdByUserId);
+    // Custom-game deletion controls are intentionally hidden for now. Keep the
+    // database row custom (provider_id NULL); this marker only suppresses the
+    // post-command delete panel for the resolved interaction result.
+    return [{ ...game, providerId: game.providerId ?? CUSTOM_UI_PROVIDER_ID }];
   }
 
   async deleteCustomGame(
