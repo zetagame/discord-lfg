@@ -5,7 +5,6 @@ import {
   claimPanelCreation,
   clearPanelMessage,
   ensureGameGroup,
-  ensureGroupsForUpcomingEvents,
   legacyLfgCards,
   listGameGroups,
   loadGameGroup,
@@ -67,7 +66,6 @@ export async function projectGamePanelAfterWrite(
 export async function syncSharedGameGroups(env: Env): Promise<void> {
   await pruneExpiredGroupMembers(env.DB);
   await pruneControlSessions(env.DB);
-  await ensureGroupsForUpcomingEvents(env.DB);
   await retireLegacyLfgCards(env);
   const groups = await listGameGroups(env.DB);
   for (const group of groups) {
@@ -75,7 +73,7 @@ export async function syncSharedGameGroups(env: Env): Promise<void> {
   }
 }
 
-export async function syncGamePanelsForEvent(env: Env, eventId: string, ensureGroups = true): Promise<void> {
+export async function syncGamePanelsForEvent(env: Env, eventId: string, ensureGroups = false): Promise<void> {
   const rows = await env.DB.prepare(`
     SELECT events.guild_id AS guildId, events.channel_id AS channelId, event_games.game_id AS gameId
     FROM events JOIN event_games ON event_games.event_id = events.id
@@ -107,9 +105,7 @@ async function syncGamePanelAttempt(
   const projection = await loadPanelProjectionState(env.DB, snapshot.group.id);
   const targetRevision = projection?.revision ?? 0;
   const eligible = await panelEligible(env, snapshot);
-  const panelChannel = snapshot.activeUserIds.length > 0
-    ? snapshot.group.channelId ?? preferredChannelId ?? snapshot.upcomingEvent?.channelId
-    : snapshot.upcomingEvent?.channelId ?? snapshot.group.channelId ?? preferredChannelId;
+  const panelChannel = snapshot.group.channelId ?? preferredChannelId;
 
   if (!eligible) {
     if (snapshot.group.discordMessageId && snapshot.group.channelId) {
@@ -231,8 +227,6 @@ function panelText(snapshot: GameGroupSnapshot, members: string[]): string {
 }
 
 async function panelEligible(env: Env, snapshot: GameGroupSnapshot): Promise<boolean> {
-  if (snapshot.upcomingEvent) return true;
-  if (snapshot.game.providerId === ANY_GAME_PROVIDER_ID) return snapshot.activeUserIds.length > 0;
   const direct = await env.DB.prepare(`
     SELECT 1
     FROM group_members
