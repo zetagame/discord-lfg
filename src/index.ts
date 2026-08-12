@@ -105,9 +105,6 @@ async function command(i: DiscordInteraction, env: Env, games: GameSelectionServ
   const name = i.data?.name;
   const actor = userId(i)!;
   try {
-    // Validate command-local input before resolving a game. A cold IGDB lookup
-    // can consume almost the whole interactive budget and should never precede
-    // an error we can detect locally.
     if (name === "lfg") return lfg(i, env, games, actor, ctx);
     if (name === "create") return createEvent(i, env, games, actor, ctx);
   } catch (error) {
@@ -474,13 +471,40 @@ async function sendScheduledNotifications(env: Env, now = new Date()): Promise<v
     user_id: string;
     status: "yes" | "maybe" | "no";
   }>();
+
+  const pending = new Map<string, {
+    id: string;
+    channelId: string;
+    title: string;
+    kind: EventDeliveryKind;
+    userIds: Set<string>;
+  }>();
   for (const event of events.results) {
     for (const kind of dueDeliveries(new Date(event.starts_at), event.status, now)) {
-      const content = kind === "reminder"
-        ? `<@${event.user_id}> Reminder: **${event.title}** starts in about an hour.`
-        : `<@${event.user_id}> **${event.title}** is starting now.`;
-      await deliver(env, event.id, event.user_id, kind, event.channel_id, content);
+      const key = `${event.id}:${kind}`;
+      const notification = pending.get(key) ?? {
+        id: event.id,
+        channelId: event.channel_id,
+        title: event.title,
+        kind,
+        userIds: new Set<string>(),
+      };
+      notification.userIds.add(event.user_id);
+      pending.set(key, notification);
     }
+  }
+
+  for (const notification of pending.values()) {
+    const alreadyDelivered = await env.DB.prepare(
+      "SELECT 1 FROM event_deliveries WHERE event_id = ? AND kind = ? LIMIT 1",
+    ).bind(notification.id, notification.kind).first();
+    if (alreadyDelivered) continue;
+    const userIds = [...notification.userIds];
+    const mentions = userIds.map((id) => `<@${id}>`).join(" ");
+    const content = notification.kind === "reminder"
+      ? `${mentions} Reminder: **${notification.title}** starts in about an hour.`
+      : `${mentions} **${notification.title}** is starting now.`;
+    await deliver(env, notification.id, "", notification.kind, notification.channelId, content, userIds);
   }
 
   const minimums = await env.DB.prepare(`
@@ -541,14 +565,12 @@ async function deliver(
   kind: EventDeliveryKind,
   channelId: string,
   content: string,
+  mentionUserIds?: string[],
 ): Promise<void> {
   if (!env.DISCORD_BOT_TOKEN) return;
   const claimed = await claimActiveEventDelivery(env.DB, eventId, userIdValue, kind);
   if (!claimed) return;
 
-  // The due-event query and delivery claim can both race an event deletion.
-  // Re-read immediately before the network side effect; if deletion won, drop
-  // the claim so there is no stale reminder/start/activation to retry later.
   if (!await eventIsActive(env.DB, eventId)) {
     await releaseEventDeliveryClaim(env.DB, eventId, userIdValue, kind);
     return;
@@ -556,7 +578,9 @@ async function deliver(
 
   const response = await postChannelMessage(env, channelId, {
     content,
-    allowed_mentions: userIdValue ? { users: [userIdValue] } : { parse: [] },
+    allowed_mentions: mentionUserIds?.length
+      ? { users: mentionUserIds }
+      : userIdValue ? { users: [userIdValue] } : { parse: [] },
   });
   if (!response?.ok) await releaseEventDeliveryClaim(env.DB, eventId, userIdValue, kind);
 }
