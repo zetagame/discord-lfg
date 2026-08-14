@@ -30,7 +30,18 @@ async function commandSchema(request: Request, env: Env, ctx: ExecutionContext):
   return Response.json([...commands, debugCommand]);
 }
 
+const REGISTER_COMMANDS_TOKEN_SHA256 = "5d6b20a3076c2a7db00f6494a859239fbc41de9970fd4406fa09d8d1e77485ca";
+
+async function authorizedRegistrationRequest(request: Request): Promise<boolean> {
+  const token = new URL(request.url).searchParams.get("token");
+  if (!token) return false;
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
+  const actual = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  return actual === REGISTER_COMMANDS_TOKEN_SHA256;
+}
+
 async function registerCommands(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  if (!await authorizedRegistrationRequest(request)) return new Response("Not found", { status: 404 });
   if (!env.DISCORD_BOT_TOKEN) return new Response("DISCORD_BOT_TOKEN is missing.", { status: 500 });
 
   const applicationResponse = await fetch("https://discord.com/api/v10/oauth2/applications/@me", {
